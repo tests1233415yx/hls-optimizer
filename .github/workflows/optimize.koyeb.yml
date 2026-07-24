@@ -22,11 +22,6 @@ jobs:
         with:
           node-version: 20
 
-      - name: Install System Dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg zip
-
       - name: Run HLS Optimizer
         env:
           EVENT_PAYLOAD: ${{ toJson(github.event.client_payload) }}
