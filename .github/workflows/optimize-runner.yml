@@ -32,12 +32,19 @@ jobs:
             # ponytail: parallel matrix jobs on the same runner box race for the dpkg lock; flock serializes instead of failing
             sudo flock /var/lib/dpkg/lock-frontend -c "apt-get update -qq && apt-get install -y zip xz-utils curl"
           fi
-          if command -v ffmpeg >/dev/null && ffmpeg -buildconf 2>/dev/null | grep -q svtav1; then
-            echo "ffmpeg already installed on this runner, skipping download"
+          STAMP=/usr/local/bin/.ffmpeg-build-stamp
+          ASSET=ffmpeg-master-latest-linux64-gpl.tar.xz
+          REMOTE_VERSION=$(curl -fsSL https://api.github.com/repos/BtbN/FFmpeg-Builds/releases/tags/latest \
+            | grep -A15 "\"name\": \"$ASSET\"" | grep -m1 '"updated_at"' | sed -E 's/.*"updated_at": *"([^"]+)".*/\1/')
+
+          if [ -n "$REMOTE_VERSION" ] && command -v ffmpeg >/dev/null \
+             && [ "$(cat "$STAMP" 2>/dev/null)" = "$REMOTE_VERSION" ] \
+             && ffmpeg -buildconf 2>/dev/null | grep -q svtav1; then
+            echo "ffmpeg already up to date ($REMOTE_VERSION), skipping download"
             ffmpeg -version | head -1
           else
-            echo "Downloading FFmpeg static build..."
-            if ! curl -fsSL --retry 5 --retry-delay 5 https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz -o /tmp/ffmpeg.tar.xz; then
+            echo "Downloading FFmpeg static build (remote build: ${REMOTE_VERSION:-unknown, API lookup failed})..."
+            if ! curl -fsSL --retry 5 --retry-delay 5 https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/$ASSET -o /tmp/ffmpeg.tar.xz; then
               echo "Error: Failed to download FFmpeg from BtbN/FFmpeg-Builds."
               exit 1
             fi
@@ -52,6 +59,7 @@ jobs:
             sudo cp /tmp/ffmpeg-extract/bin/ffprobe /usr/local/bin/
             sudo chmod +x /usr/local/bin/ffmpeg /usr/local/bin/ffprobe
             rm -rf /tmp/ffmpeg.tar.xz /tmp/ffmpeg-extract
+            [ -n "$REMOTE_VERSION" ] && echo "$REMOTE_VERSION" | sudo tee "$STAMP" >/dev/null
             ffmpeg -version | head -1
             ffmpeg -buildconf | grep svtav1 || (echo "ERROR: libsvtav1 not compiled into this ffmpeg build" && exit 1)
           fi
