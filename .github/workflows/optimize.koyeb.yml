@@ -1,30 +1,67 @@
 name: HLS Video Optimizer (Koyeb Self-Hosted)
-
 on:
   repository_dispatch:
     types: [optimize-hls]
-
 jobs:
-  optimize:
-    name: Process HLS Video (Koyeb)
+  setup:
     runs-on: [self-hosted, koyeb]
-
-    # Restrict runner permissions to minimum
-    permissions:
-      contents: read
-
+    outputs:
+      chunks: ${{ steps.set-matrix.outputs.chunks }}
     steps:
-      - name: Checkout worker repository
-        uses: actions/checkout@v4
-
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 20
-
-      - name: Run HLS Optimizer
-        env:
-          EVENT_PAYLOAD: ${{ toJson(github.event.client_payload) }}
-          PRIVATE_REPO_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+      - name: Generate Matrix
+        id: set-matrix
         run: |
-          node optimize.js
+          echo "chunks<<EOF" >> $GITHUB_OUTPUT
+          node -e '
+            const fs = require("fs");
+            const event = JSON.parse(fs.readFileSync(process.env.GITHUB_EVENT_PATH, "utf8"));
+            const payload = event.client_payload || {};
+            const resolutions = payload.resolutions || [{"label":"1080p"}];
+            const parts = payload.parts || [{"part_index":1,"start_time":0,"end_time":null,"start_segment_index":0,"extract_subtitles":true,"extract_audio":true}];
+            let include = payload.include || [];
+            if (include.length === 0) {
+              for (const r of resolutions) {
+                for (const p of parts) {
+                  if (r.label === "subtitles" && p.part_index > 1) {
+                    continue; // Only run subtitles for Part 1
+                  }
+                  include.push({ resolution: r, part: p });
+                }
+              }
+            } else {
+              include = include.map(item => {
+                const fullRes = resolutions.find(r => r.label === item.resolution.label) || item.resolution;
+                const fullPart = parts.find(p => p.part_index === item.part.part_index) || item.part;
+                return { resolution: fullRes, part: fullPart };
+              });
+            }
+            const CHUNK_SIZE = 256;
+            const chunks = [];
+            for (let i = 0; i < include.length; i += CHUNK_SIZE) {
+              const chunkIndex = Math.floor(i / CHUNK_SIZE) + 1;
+              const chunkItems = include.slice(i, i + CHUNK_SIZE).map(item => ({
+                ...item,
+                chunk_index: chunkIndex
+              }));
+              chunks.push({
+                include: chunkItems
+              });
+            }
+            console.log(JSON.stringify(chunks));
+          ' >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+  optimize:
+    needs: setup
+    strategy:
+      fail-fast: false
+      matrix:
+        chunk: ${{ fromJson(needs.setup.outputs.chunks) }}
+    uses: ./.github/workflows/optimize-runner.local.yml
+    with:
+      matrix_json: ${{ toJson(matrix.chunk) }}
+    secrets: inherit
