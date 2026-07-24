@@ -8,8 +8,6 @@ jobs:
   optimize:
     name: Process HLS Video (Koyeb)
     runs-on: [self-hosted, koyeb]
-    container:
-      image: node:20-bookworm
 
     # Restrict runner permissions to minimum
     permissions:
@@ -19,10 +17,15 @@ jobs:
       - name: Checkout worker repository
         uses: actions/checkout@v4
 
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
       - name: Install System Dependencies
         run: |
-          apt-get update
-          apt-get install -y ffmpeg zip
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg zip
 
       - name: Run HLS Optimizer
         env:
