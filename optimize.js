@@ -259,7 +259,11 @@ function adjustVideoParams(label, codec, origBitrateKbps, origHeight, duration, 
 
 
 // Config and constants
-const WORK_DIR = '/tmp/hls-worker';
+// ponytail: fixed path collided across concurrent matrix jobs on the same self-hosted VPS
+// (shared /tmp/hls-worker/cache/part_0 -> ENOENT races). RUNNER_TEMP is job-scoped and unique.
+const WORK_DIR = process.env.RUNNER_TEMP
+  ? path.join(process.env.RUNNER_TEMP, 'hls-worker')
+  : `/tmp/hls-worker-${process.pid}`;
 const INPUT_FILE = path.join(WORK_DIR, 'input.txt');
 const OUTPUT_DIR = path.join(WORK_DIR, 'hls-output');
 const MAX_ZIP_BYTES = 1024 * 1024 * 1024; // 1GB limit for zipped segments
