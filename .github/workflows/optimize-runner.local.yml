@@ -1,0 +1,31 @@
+name: HLS Video Optimizer Runner (Local/Koyeb)
+on:
+  workflow_call:
+    inputs:
+      matrix_json:
+        required: true
+        type: string
+
+jobs:
+  run-matrix:
+    name: "${{ matrix.chunk_index }}: ${{ matrix.resolution.label }} - P${{ matrix.part.part_index }}"
+    runs-on: [self-hosted, koyeb]
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(inputs.matrix_json) }}
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout worker repository
+        uses: actions/checkout@v6
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+      - name: Run HLS Optimizer
+        env:
+          ACTIVE_RESOLUTION_LABEL: ${{ matrix.resolution.label }}
+          ACTIVE_PART: ${{ toJson(matrix.part) }}
+          PRIVATE_REPO_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+        run: |
+          node optimize.js
