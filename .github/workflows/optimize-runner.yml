@@ -24,26 +24,37 @@ jobs:
           node-version: 24
       - name: Install System Dependencies
         run: |
-          sudo apt-get update || true
-          sudo apt-get install -y zip xz-utils curl
-          echo "Downloading FFmpeg static build..."
-          if ! curl -fsSL --retry 5 --retry-delay 5 https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz -o /tmp/ffmpeg.tar.xz; then
-            echo "Error: Failed to download FFmpeg from BtbN/FFmpeg-Builds."
-            exit 1
+          NEED_APT=0
+          for bin in zip unxz curl; do
+            command -v "$bin" >/dev/null || NEED_APT=1
+          done
+          if [ "$NEED_APT" = "1" ]; then
+            # ponytail: parallel matrix jobs on the same runner box race for the dpkg lock; flock serializes instead of failing
+            sudo flock /var/lib/dpkg/lock-frontend -c "apt-get update -qq && apt-get install -y zip xz-utils curl"
           fi
-          if head -n 5 /tmp/ffmpeg.tar.xz | grep -q -i -E "html|doctype|xml"; then
-            echo "Error: Downloaded file is HTML/XML instead of a valid archive. Printing contents:"
-            cat /tmp/ffmpeg.tar.xz | head -n 50
-            exit 1
+          if command -v ffmpeg >/dev/null && ffmpeg -buildconf 2>/dev/null | grep -q svtav1; then
+            echo "ffmpeg already installed on this runner, skipping download"
+            ffmpeg -version | head -1
+          else
+            echo "Downloading FFmpeg static build..."
+            if ! curl -fsSL --retry 5 --retry-delay 5 https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz -o /tmp/ffmpeg.tar.xz; then
+              echo "Error: Failed to download FFmpeg from BtbN/FFmpeg-Builds."
+              exit 1
+            fi
+            if head -n 5 /tmp/ffmpeg.tar.xz | grep -q -i -E "html|doctype|xml"; then
+              echo "Error: Downloaded file is HTML/XML instead of a valid archive. Printing contents:"
+              cat /tmp/ffmpeg.tar.xz | head -n 50
+              exit 1
+            fi
+            mkdir -p /tmp/ffmpeg-extract
+            tar -xf /tmp/ffmpeg.tar.xz -C /tmp/ffmpeg-extract --strip-components=1
+            sudo cp /tmp/ffmpeg-extract/bin/ffmpeg /usr/local/bin/
+            sudo cp /tmp/ffmpeg-extract/bin/ffprobe /usr/local/bin/
+            sudo chmod +x /usr/local/bin/ffmpeg /usr/local/bin/ffprobe
+            rm -rf /tmp/ffmpeg.tar.xz /tmp/ffmpeg-extract
+            ffmpeg -version | head -1
+            ffmpeg -buildconf | grep svtav1 || (echo "ERROR: libsvtav1 not compiled into this ffmpeg build" && exit 1)
           fi
-          mkdir -p /tmp/ffmpeg-extract
-          tar -xf /tmp/ffmpeg.tar.xz -C /tmp/ffmpeg-extract --strip-components=1
-          sudo cp /tmp/ffmpeg-extract/bin/ffmpeg /usr/local/bin/
-          sudo cp /tmp/ffmpeg-extract/bin/ffprobe /usr/local/bin/
-          sudo chmod +x /usr/local/bin/ffmpeg /usr/local/bin/ffprobe
-          rm -rf /tmp/ffmpeg.tar.xz /tmp/ffmpeg-extract
-          ffmpeg -version | head -1
-          ffmpeg -buildconf | grep svtav1 || (echo "ERROR: libsvtav1 not compiled into this ffmpeg build" && exit 1)
       - name: Run HLS Optimizer
         env:
           ACTIVE_RESOLUTION_LABEL: ${{ matrix.resolution.label }}
