@@ -23,6 +23,8 @@ jobs:
         with:
           node-version: 24
       - name: Install System Dependencies
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           NEED_APT=0
           for bin in zip unxz curl; do
@@ -32,10 +34,17 @@ jobs:
             # ponytail: parallel matrix jobs on the same runner box race for the dpkg lock; flock serializes instead of failing
             sudo flock /var/lib/dpkg/lock-frontend -c "apt-get update -qq && apt-get install -y zip xz-utils curl"
           fi
-          STAMP=/usr/local/bin/.ffmpeg-build-stamp
+          # ponytail: 3 runner agents share this VPS; a shared /usr/local/bin/ffmpeg races with
+          # whichever agent is mid-encode (ETXTBSY on overwrite). Cache per-agent instead.
+          FFDIR="$HOME/.cache/ffmpeg-${RUNNER_NAME:-default}"
+          mkdir -p "$FFDIR"
+          echo "$FFDIR" >> "$GITHUB_PATH"
+          export PATH="$FFDIR:$PATH"
+
+          STAMP="$FFDIR/.build-stamp"
           ASSET=ffmpeg-master-latest-linux64-gpl.tar.xz
-          REMOTE_VERSION=$(curl -fsSL https://api.github.com/repos/BtbN/FFmpeg-Builds/releases/tags/latest \
-            | grep -A15 "\"name\": \"$ASSET\"" | grep -m1 '"updated_at"' | sed -E 's/.*"updated_at": *"([^"]+)".*/\1/')
+          REMOTE_VERSION=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" https://api.github.com/repos/BtbN/FFmpeg-Builds/releases/tags/latest \
+            | grep -A40 "\"name\": \"$ASSET\"" | grep -m1 '"updated_at"' | sed -E 's/.*"updated_at": *"([^"]+)".*/\1/')
 
           if [ -n "$REMOTE_VERSION" ] && command -v ffmpeg >/dev/null \
              && [ "$(cat "$STAMP" 2>/dev/null)" = "$REMOTE_VERSION" ] \
@@ -44,22 +53,23 @@ jobs:
             ffmpeg -version | head -1
           else
             echo "Downloading FFmpeg static build (remote build: ${REMOTE_VERSION:-unknown, API lookup failed})..."
-            if ! curl -fsSL --retry 5 --retry-delay 5 https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/$ASSET -o /tmp/ffmpeg.tar.xz; then
+            DL="${RUNNER_TEMP:-/tmp}/ffmpeg.tar.xz"
+            EXTRACT="${RUNNER_TEMP:-/tmp}/ffmpeg-extract"
+            if ! curl -fsSL --retry 5 --retry-delay 5 https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/$ASSET -o "$DL"; then
               echo "Error: Failed to download FFmpeg from BtbN/FFmpeg-Builds."
               exit 1
             fi
-            if head -n 5 /tmp/ffmpeg.tar.xz | grep -q -i -E "html|doctype|xml"; then
+            if head -n 5 "$DL" | grep -q -i -E "html|doctype|xml"; then
               echo "Error: Downloaded file is HTML/XML instead of a valid archive. Printing contents:"
-              cat /tmp/ffmpeg.tar.xz | head -n 50
+              cat "$DL" | head -n 50
               exit 1
             fi
-            mkdir -p /tmp/ffmpeg-extract
-            tar -xf /tmp/ffmpeg.tar.xz -C /tmp/ffmpeg-extract --strip-components=1
-            sudo cp /tmp/ffmpeg-extract/bin/ffmpeg /usr/local/bin/
-            sudo cp /tmp/ffmpeg-extract/bin/ffprobe /usr/local/bin/
-            sudo chmod +x /usr/local/bin/ffmpeg /usr/local/bin/ffprobe
-            rm -rf /tmp/ffmpeg.tar.xz /tmp/ffmpeg-extract
-            [ -n "$REMOTE_VERSION" ] && echo "$REMOTE_VERSION" | sudo tee "$STAMP" >/dev/null
+            mkdir -p "$EXTRACT"
+            tar -xf "$DL" -C "$EXTRACT" --strip-components=1
+            cp "$EXTRACT/bin/ffmpeg" "$EXTRACT/bin/ffprobe" "$FFDIR/"
+            chmod +x "$FFDIR/ffmpeg" "$FFDIR/ffprobe"
+            rm -rf "$DL" "$EXTRACT"
+            [ -n "$REMOTE_VERSION" ] && echo "$REMOTE_VERSION" > "$STAMP"
             ffmpeg -version | head -1
             ffmpeg -buildconf | grep svtav1 || (echo "ERROR: libsvtav1 not compiled into this ffmpeg build" && exit 1)
           fi
