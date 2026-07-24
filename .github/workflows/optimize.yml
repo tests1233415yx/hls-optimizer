@@ -8,6 +8,10 @@ jobs:
     outputs:
       chunks: ${{ steps.set-matrix.outputs.chunks }}
     steps:
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
       - name: Generate Matrix
         id: set-matrix
         run: |
