@@ -1,7 +1,7 @@
 name: HLS Video Optimizer (Self-Hosted)
 on:
   repository_dispatch:
-    types: [optimize-hls-local]
+    types: [optimize-hls]
 jobs:
   setup:
     runs-on: self-hosted
@@ -57,7 +57,7 @@ jobs:
       fail-fast: false
       matrix:
         chunk: ${{ fromJson(needs.setup.outputs.chunks) }}
-    uses: ./.github/workflows/optimize-runner.local.yml
+    uses: ./.github/workflows/optimize-runner.yml
     with:
       matrix_json: ${{ toJson(matrix.chunk) }}
     secrets: inherit
