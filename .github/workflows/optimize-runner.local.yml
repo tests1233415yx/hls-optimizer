@@ -1,0 +1,53 @@
+name: HLS Video Optimizer Runner (Self-Hosted)
+on:
+  workflow_call:
+    inputs:
+      matrix_json:
+        required: true
+        type: string
+
+jobs:
+  run-matrix:
+    name: "${{ matrix.chunk_index }}: ${{ matrix.resolution.label }} - P${{ matrix.part.part_index }}"
+    runs-on: self-hosted
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(inputs.matrix_json) }}
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout worker repository
+        uses: actions/checkout@v6
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+      - name: Install System Dependencies
+        run: |
+          sudo apt-get update || true
+          sudo apt-get install -y zip xz-utils curl
+          echo "Downloading FFmpeg static build..."
+          if ! curl -fsSL --retry 5 --retry-delay 5 https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz -o /tmp/ffmpeg.tar.xz; then
+            echo "Error: Failed to download FFmpeg from BtbN/FFmpeg-Builds."
+            exit 1
+          fi
+          if head -n 5 /tmp/ffmpeg.tar.xz | grep -q -i -E "html|doctype|xml"; then
+            echo "Error: Downloaded file is HTML/XML instead of a valid archive. Printing contents:"
+            cat /tmp/ffmpeg.tar.xz | head -n 50
+            exit 1
+          fi
+          mkdir -p /tmp/ffmpeg-extract
+          tar -xf /tmp/ffmpeg.tar.xz -C /tmp/ffmpeg-extract --strip-components=1
+          sudo cp /tmp/ffmpeg-extract/bin/ffmpeg /usr/local/bin/
+          sudo cp /tmp/ffmpeg-extract/bin/ffprobe /usr/local/bin/
+          sudo chmod +x /usr/local/bin/ffmpeg /usr/local/bin/ffprobe
+          rm -rf /tmp/ffmpeg.tar.xz /tmp/ffmpeg-extract
+          ffmpeg -version | head -1
+          ffmpeg -buildconf | grep svtav1 || (echo "ERROR: libsvtav1 not compiled into this ffmpeg build" && exit 1)
+      - name: Run HLS Optimizer
+        env:
+          ACTIVE_RESOLUTION_LABEL: ${{ matrix.resolution.label }}
+          ACTIVE_PART: ${{ toJson(matrix.part) }}
+          PRIVATE_REPO_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+        run: |
+          node optimize.js
