@@ -4,7 +4,7 @@ on:
     types: [optimize-hls]
 jobs:
   setup:
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     outputs:
       chunks: ${{ steps.set-matrix.outputs.chunks }}
     steps:
