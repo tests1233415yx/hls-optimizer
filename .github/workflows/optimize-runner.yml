@@ -42,7 +42,11 @@ jobs:
           export PATH="$FFDIR:$PATH"
 
           STAMP="$FFDIR/.build-stamp"
-          ASSET=ffmpeg-master-latest-linux64-gpl.tar.xz
+          case "$(uname -m)" in
+            aarch64|arm64) FFARCH=linuxarm64 ;;
+            *) FFARCH=linux64 ;;
+          esac
+          ASSET=ffmpeg-master-latest-${FFARCH}-gpl.tar.xz
           REMOTE_VERSION=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" https://api.github.com/repos/BtbN/FFmpeg-Builds/releases/tags/latest \
             | grep -A40 "\"name\": \"$ASSET\"" | grep -m1 '"updated_at"' | sed -E 's/.*"updated_at": *"([^"]+)".*/\1/')
 
