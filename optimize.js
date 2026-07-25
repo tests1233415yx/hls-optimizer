@@ -1318,14 +1318,18 @@ function detectSceneCuts(inputSource, startTime, endTime) {
     if (startTime > 0) {
       args.push('-ss', startTime.toFixed(3));
     }
-    if (endTime !== null) {
-      args.push('-to', endTime.toFixed(3));
-    }
     args.push(
       '-analyzeduration', '100M',
       '-probesize', '100M',
       '-protocol_whitelist', 'file,http,tcp,https,tls',
       '-i', inputSource,
+    );
+    // Output -t rather than input -to; see the video job for why. The scene-cut timestamps
+    // this returns must stay on the same part-relative clock as the encode's -force_key_frames.
+    if (endTime !== null) {
+      args.push('-t', Math.max(0, endTime - startTime).toFixed(3));
+    }
+    args.push(
       '-an',
       '-vf', "scale=-2:240,select='gt(scene,0.4)',showinfo",
       '-f', 'null',
@@ -1940,7 +1944,8 @@ async function main() {
       console.log(`Converting audio stream #${aud.index} (${aud.codec})...`);
       const audPlaylistPath = path.join(OUTPUT_DIR, `audio_${aud.index}.m3u8`);
       const audSegmentPattern = path.join(OUTPUT_DIR, `audio_${aud.index}_%05d.m4s`);
-      const audInitName = `audio_${aud.index}_init.mp4`;
+      // Per part, for the same reason as the video init segment above.
+      const audInitName = `audio_${aud.index}_part${partIndex.toString().padStart(4, '0')}_init.mp4`;
       
       let targetAudioBitrate;
       if (aud.bitRate) {
@@ -1963,15 +1968,16 @@ async function main() {
       if (startTime > 0) {
         audFfmpegArgs.push('-ss', startTime.toFixed(3));
       }
-      if (endTime !== null) {
-        audFfmpegArgs.push('-to', endTime.toFixed(3));
-      }
       audFfmpegArgs.push(
         '-analyzeduration', '100M',
         '-probesize', '100M',
         '-protocol_whitelist', 'file,http,tcp,https,tls'
       );
       audFfmpegArgs.push('-i', `"${inputSource}"`);
+      // Output -t rather than input -to; see the video job for why.
+      if (endTime !== null) {
+        audFfmpegArgs.push('-t', Math.max(0, endTime - startTime).toFixed(3));
+      }
       audFfmpegArgs.push(
         '-vn',
         '-map', `0:${aud.index}`,
@@ -2013,7 +2019,7 @@ async function main() {
 
   // Zip audio files separately if they were extracted (runs on metadata/audio runner or primary runner VM)
   const audioSegRegex = /^audio_\d+_(\d{5})\.m4s$/;
-  const audioInitRegex = /^audio_\d+_init\.mp4$/;
+  const audioInitRegex = /^audio_\d+_part\d{4}_init\.mp4$/;
   let audioSegmentStart = null;
   let audioSegmentEnd = null;
   const audioFilesToZip = fs.readdirSync(OUTPUT_DIR)
@@ -2130,7 +2136,13 @@ async function main() {
     const useCodecSuffix = resolvedCodecs.length > 1;
     const playlistName = useCodecSuffix ? `variant_${codec}.m3u8` : 'variant.m3u8';
     const segmentPattern = useCodecSuffix ? `seg_${codec}_%05d.m4s` : 'seg%05d.m4s';
-    const initName = useCodecSuffix ? `init_${codec}.mp4` : 'init.mp4';
+    // Each part is an independent ffmpeg run, so each writes its own fMP4 init segment.
+    // Naming them all "init.mp4" made every part's init collide on one name, so the
+    // merged playlist could only carry one EXT-X-MAP and every part had to be decoded
+    // with part 1's track configuration. Name them per part and keep each part's own
+    // EXT-X-MAP in the merged playlist instead.
+    const partSuffix = `part${partIndex.toString().padStart(4, '0')}`;
+    const initName = useCodecSuffix ? `init_${codec}_${partSuffix}.mp4` : `init_${partSuffix}.mp4`;
 
     const playlistPath = path.join(RES_OUTPUT_DIR, playlistName);
     const segmentPatternPath = path.join(RES_OUTPUT_DIR, segmentPattern);
@@ -2143,15 +2155,19 @@ async function main() {
     if (startTime > 0) {
       ffmpegArgs.push('-ss', startTime.toFixed(3));
     }
-    if (endTime !== null) {
-      ffmpegArgs.push('-to', endTime.toFixed(3));
-    }
     ffmpegArgs.push(
       '-analyzeduration', '100M',
       '-probesize', '100M',
       '-protocol_whitelist', 'file,http,tcp,https,tls'
     );
     ffmpegArgs.push('-i', `"${inputSource}"`);
+    // Part length as an OUTPUT -t, not an input -to: input -ss combined with input -to has
+    // meant different things across ffmpeg releases (absolute input timestamp vs relative
+    // to the seek point), and getting it wrong silently produces parts of the wrong length
+    // rather than an error. Output -t is always "stop writing after this much output".
+    if (endTime !== null) {
+      ffmpegArgs.push('-t', Math.max(0, endTime - startTime).toFixed(3));
+    }
     ffmpegArgs.push(
       '-f', 'hls',
       '-hls_time', '6',
@@ -2162,7 +2178,9 @@ async function main() {
       '-hls_flags', 'independent_segments',
       '-start_number', startSegmentIndex.toString()
     );
-    ffmpegArgs.push('-map', '0:v');
+    // 0:v:0, not 0:v: MKV/MP4 containers often carry embedded cover art as a second
+    // (attached_pic) video stream, and mapping it makes the HLS muxer reject the job.
+    ffmpegArgs.push('-map', '0:v:0');
 
     let resolvedOutputWidth = inferredWidth;
     let resolvedOutputHeight = inferredHeight;
@@ -2250,10 +2268,12 @@ async function main() {
     // Group segments and package ZIPs
     console.log(`Grouping segments and packaging ZIPs for ${codec}...`);
     const videoSegRegex = useCodecSuffix ? new RegExp(`^seg_${codec}_(\\d{5})\\.m4s$`) : /^seg(\d{5})\.m4s$/;
-    const videoInitRegex = useCodecSuffix ? new RegExp(`^init_${codec}\\.mp4$`) : /^init\.mp4$/;
+    const videoInitRegex = useCodecSuffix
+      ? new RegExp(`^init_${codec}_part\\d{4}\\.mp4$`)
+      : /^init_part\d{4}\.mp4$/;
     const subtitleSegRegex = /^subtitle_\d+_(\d{5})\.vtt$/;
     const audioSegRegex = /^audio_\d+_(\d{5})\.m4s$/;
-    const audioInitRegex = /^audio_\d+_init\.mp4$/;
+    const audioInitRegex = /^audio_\d+_part\d{4}_init\.mp4$/;
 
     const videoFiles = fs.readdirSync(RES_OUTPUT_DIR)
       .filter(name => videoSegRegex.test(name) || videoInitRegex.test(name))
