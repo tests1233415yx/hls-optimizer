@@ -490,7 +490,7 @@ function downloadAsset(urlStr, token, destPath, maxRetries = 3) {
 
 // Upload a single file as a release asset (with retries on transient connection issues)
 async function uploadAssetFile(uploadUrl, assetName, filePath, contentType, token) {
-  const stat = fs.statSync(filePath);
+  const stat = await fs.promises.stat(filePath);
   const baseUploadUrl = uploadUrl.split('{')[0];
   const uploadEndpoint = `${baseUploadUrl}?name=${encodeURIComponent(assetName)}`;
   const url = new URL(uploadEndpoint);
@@ -752,7 +752,7 @@ function parseSegmentDurations(playlistText) {
   return durations;
 }
 
-function segmentVtt(vttContent, segmentDurations, videoDuration, outputDir, subIndex, startSegmentNumber) {
+async function segmentVtt(vttContent, segmentDurations, videoDuration, outputDir, subIndex, startSegmentNumber) {
   const lines = vttContent.split(/\r?\n/);
   const cues = [];
   let i = 0;
@@ -867,7 +867,7 @@ function segmentVtt(vttContent, segmentDurations, videoDuration, outputDir, subI
     const finalSegIdx = startSegmentNumber !== undefined ? (startSegmentNumber + segIdx) : segIdx;
     const fileName = `subtitle_${subIndex}_${String(finalSegIdx).padStart(5, '0')}.vtt`;
     const filePath = path.join(outputDir, fileName);
-    fs.writeFileSync(filePath, segmentContent, 'utf8');
+    await fs.promises.writeFile(filePath, segmentContent, 'utf8');
     segmentFiles.push(fileName);
   }
   
@@ -883,125 +883,131 @@ function segmentVtt(vttContent, segmentDurations, videoDuration, outputDir, subI
   return playlistText;
 }
 
+function buildDownloadHeaders(parsed, token) {
+  const headers = {
+    'User-Agent': 'github-storage-worker/1.0.0',
+  };
+  if (parsed.hostname.endsWith('github.com')) {
+    headers['Authorization'] = `Bearer ${token}`;
+    headers['Accept'] = 'application/octet-stream';
+  }
+  return headers;
+}
+
+function attemptDownload(url, destPath, token) {
+  return new Promise((resolve, reject) => {
+    let file = null;
+    let activeRequest = null;
+    let downloadedBytes = 0;
+    let totalBytes = 0;
+    let isRejected = false;
+
+    function cleanupAndReject(err) {
+      if (isRejected) return;
+      isRejected = true;
+
+      if (activeRequest) {
+        activeRequests.delete(activeRequest);
+        try { activeRequest.destroy(); } catch (e) {}
+      }
+      if (file) {
+        file.close(() => {
+          fs.unlink(destPath, () => {});
+        });
+      } else {
+        fs.unlink(destPath, () => {});
+      }
+      reject(err);
+    }
+
+    function handleResponse(req, res) {
+      res.on('error', (err) => {
+        cleanupAndReject(err);
+      });
+
+      if (res.statusCode === 302 || res.statusCode === 301) {
+        const loc = res.headers.location;
+        res.resume(); // consume response body
+        activeRequests.delete(req);
+        file.close(() => {
+          if (!loc) {
+            cleanupAndReject(new Error('Redirect location missing'));
+            return;
+          }
+          startDownload(loc);
+        });
+        return;
+      }
+
+      if (res.statusCode !== 200) {
+        res.resume();
+        cleanupAndReject(new Error(`Failed to download: status ${res.statusCode}`));
+        return;
+      }
+
+      totalBytes = parseInt(res.headers['content-length'] || '0', 10);
+      let lastLoggedMB = 0;
+
+      res.on('data', (chunk) => {
+        downloadedBytes += chunk.length;
+        const currentMB = Math.floor(downloadedBytes / (50 * 1024 * 1024)) * 50;
+        if (currentMB > lastLoggedMB) {
+          lastLoggedMB = currentMB;
+          const percent = totalBytes ? ` (${Math.round((downloadedBytes / totalBytes) * 100)}%)` : '';
+          console.log(`Downloaded ${currentMB} MB${percent}...`);
+        }
+      });
+
+      res.pipe(file);
+
+      file.on('finish', () => {
+        file.close(() => {
+          activeRequests.delete(req);
+          if (totalBytes > 0 && downloadedBytes !== totalBytes) {
+            cleanupAndReject(new Error(`Incomplete download: expected ${totalBytes} bytes, got ${downloadedBytes} bytes`));
+          } else {
+            resolve();
+          }
+        });
+      });
+    }
+
+    function startDownload(currentUrl) {
+      const parsed = new URL(currentUrl);
+      const headers = buildDownloadHeaders(parsed, token);
+
+      file = fs.createWriteStream(destPath);
+      file.on('error', (err) => {
+        cleanupAndReject(err);
+      });
+
+      const req = https.get({
+        protocol: parsed.protocol,
+        hostname: parsed.hostname,
+        port: parsed.port,
+        path: parsed.pathname + parsed.search,
+        headers,
+        timeout: 60000 // 60 seconds inactivity timeout
+      }, (res) => handleResponse(req, res));
+
+      activeRequest = req;
+      activeRequests.add(req);
+
+      req.on('timeout', () => {
+        cleanupAndReject(new Error('Download connection timed out after 60 seconds of inactivity'));
+      });
+
+      req.on('error', (err) => {
+        cleanupAndReject(err);
+      });
+    }
+
+    startDownload(url);
+  });
+}
+
 function downloadFile(url, destPath, token, maxRetries = 3) {
   let attempt = 0;
-
-  function tryDownload() {
-    attempt++;
-    return new Promise((resolve, reject) => {
-      let file = null;
-      let activeRequest = null;
-      let downloadedBytes = 0;
-      let totalBytes = 0;
-      let isRejected = false;
-
-      function cleanupAndReject(err) {
-        if (isRejected) return;
-        isRejected = true;
-        
-        if (activeRequest) {
-          activeRequests.delete(activeRequest);
-          try { activeRequest.destroy(); } catch (e) {}
-        }
-        if (file) {
-          file.close(() => {
-            fs.unlink(destPath, () => {});
-          });
-        } else {
-          fs.unlink(destPath, () => {});
-        }
-        reject(err);
-      }
-
-      function startDownload(currentUrl) {
-        const parsed = new URL(currentUrl);
-        const headers = {
-          'User-Agent': 'github-storage-worker/1.0.0',
-        };
-        if (parsed.hostname.endsWith('github.com')) {
-          headers['Authorization'] = `Bearer ${token}`;
-          headers['Accept'] = 'application/octet-stream';
-        }
-
-        file = fs.createWriteStream(destPath);
-        file.on('error', (err) => {
-          cleanupAndReject(err);
-        });
-
-        const req = https.get({
-          protocol: parsed.protocol,
-          hostname: parsed.hostname,
-          port: parsed.port,
-          path: parsed.pathname + parsed.search,
-          headers,
-          timeout: 60000 // 60 seconds inactivity timeout
-        }, (res) => {
-          res.on('error', (err) => {
-            cleanupAndReject(err);
-          });
-
-          if (res.statusCode === 302 || res.statusCode === 301) {
-            const loc = res.headers.location;
-            res.resume(); // consume response body
-            activeRequests.delete(req);
-            file.close(() => {
-              if (!loc) {
-                cleanupAndReject(new Error('Redirect location missing'));
-                return;
-              }
-              startDownload(loc);
-            });
-            return;
-          }
-
-          if (res.statusCode !== 200) {
-            res.resume();
-            cleanupAndReject(new Error(`Failed to download: status ${res.statusCode}`));
-            return;
-          }
-
-          totalBytes = parseInt(res.headers['content-length'] || '0', 10);
-          let lastLoggedMB = 0;
-
-          res.on('data', (chunk) => {
-            downloadedBytes += chunk.length;
-            const currentMB = Math.floor(downloadedBytes / (50 * 1024 * 1024)) * 50;
-            if (currentMB > lastLoggedMB) {
-              lastLoggedMB = currentMB;
-              const percent = totalBytes ? ` (${Math.round((downloadedBytes / totalBytes) * 100)}%)` : '';
-              console.log(`Downloaded ${currentMB} MB${percent}...`);
-            }
-          });
-
-          res.pipe(file);
-
-          file.on('finish', () => {
-            file.close(() => {
-              activeRequests.delete(req);
-              if (totalBytes > 0 && downloadedBytes !== totalBytes) {
-                cleanupAndReject(new Error(`Incomplete download: expected ${totalBytes} bytes, got ${downloadedBytes} bytes`));
-              } else {
-                resolve();
-              }
-            });
-          });
-        });
-
-        activeRequest = req;
-        activeRequests.add(req);
-
-        req.on('timeout', () => {
-          cleanupAndReject(new Error('Download connection timed out after 60 seconds of inactivity'));
-        });
-
-        req.on('error', (err) => {
-          cleanupAndReject(err);
-        });
-      }
-
-      startDownload(url);
-    });
-  }
 
   return new Promise((resolve, reject) => {
     function execute() {
@@ -1009,7 +1015,8 @@ function downloadFile(url, destPath, token, maxRetries = 3) {
         reject(new Error('Download aborted due to process cleanup'));
         return;
       }
-      tryDownload()
+      attempt++;
+      attemptDownload(url, destPath, token)
         .then(resolve)
         .catch((err) => {
           if (isGlobalAborted || err.message === 'aborted') {
@@ -1060,38 +1067,40 @@ function recordAccess(assetIdx) {
 
 function cleanCache() {
   if (!fs.existsSync(cacheDir)) return;
-  const files = fs.readdirSync(cacheDir)
-    .filter(name => name.startsWith('part_') && !name.endsWith('.tmp'))
-    .map(name => parseInt(name.substring(5), 10))
-    .filter(num => !isNaN(num));
+  (async () => {
+    const files = (await fs.promises.readdir(cacheDir))
+      .filter(name => name.startsWith('part_') && !name.endsWith('.tmp'))
+      .map(name => parseInt(name.substring(5), 10))
+      .filter(num => !isNaN(num));
 
-  if (files.length <= MAX_CACHED_CHUNKS) return;
+    if (files.length <= MAX_CACHED_CHUNKS) return;
 
-  files.sort((a, b) => {
-    const idxA = chunkAccessOrder.indexOf(a);
-    const idxB = chunkAccessOrder.indexOf(b);
-    return idxA - idxB;
-  });
+    files.sort((a, b) => {
+      const idxA = chunkAccessOrder.indexOf(a);
+      const idxB = chunkAccessOrder.indexOf(b);
+      return idxA - idxB;
+    });
 
-  let deletedCount = 0;
-  const targetDeleteCount = files.length - MAX_CACHED_CHUNKS;
+    let deletedCount = 0;
+    const targetDeleteCount = files.length - MAX_CACHED_CHUNKS;
 
-  for (const assetIdx of files) {
-    if (deletedCount >= targetDeleteCount) break;
-    if (activeDownloads.has(assetIdx)) continue;
-    if (activeReads.has(assetIdx) && activeReads.get(assetIdx) > 0) continue;
+    for (const assetIdx of files) {
+      if (deletedCount >= targetDeleteCount) break;
+      if (activeDownloads.has(assetIdx)) continue;
+      if (activeReads.has(assetIdx) && activeReads.get(assetIdx) > 0) continue;
 
-    const oldPath = path.join(cacheDir, `part_${assetIdx}`);
-    if (fs.existsSync(oldPath)) {
-      console.error(`[Proxy Cache] Deleting old cached chunk ${assetIdx} to free up space`);
-      try {
-        fs.unlinkSync(oldPath);
-        deletedCount++;
-      } catch (e) {
-        console.warn(`[Proxy Cache] Failed to delete chunk ${assetIdx}:`, e);
+      const oldPath = path.join(cacheDir, `part_${assetIdx}`);
+      if (fs.existsSync(oldPath)) {
+        console.error(`[Proxy Cache] Deleting old cached chunk ${assetIdx} to free up space`);
+        try {
+          fs.unlinkSync(oldPath);
+          deletedCount++;
+        } catch (e) {
+          console.warn(`[Proxy Cache] Failed to delete chunk ${assetIdx}:`, e);
+        }
       }
     }
-  }
+  })();
 }
 
 function getOrDownloadPart(assetIdx, partAssets, token) {
@@ -1807,7 +1816,7 @@ async function main() {
           await execAsync(extractCmd, { stdio: 'inherit' });
 
           if (fs.existsSync(subExtPath)) {
-            const rawSize = fs.statSync(subExtPath).size;
+            const rawSize = (await fs.promises.stat(subExtPath)).size;
             console.log(`Bitmap subtitle stream #${sub.index} extracted (${(rawSize / 1024).toFixed(1)} KB)`);
 
             subtitlePlaylists.push({
@@ -1834,7 +1843,7 @@ async function main() {
             try {
               execSync(`zip -0 -j "${zipPath}" -@ < "${listFilePath}"`, { stdio: 'ignore' });
 
-              const zipSize = fs.statSync(zipPath).size;
+              const zipSize = (await fs.promises.stat(zipPath)).size;
               console.log(`Uploading bitmap subtitle ZIP ${zipName} (${(zipSize / 1024).toFixed(1)} KB)...`);
               const uploadRes = await uploadAssetWithRotation(zipName, zipPath, 'application/zip');
 
@@ -1878,7 +1887,7 @@ async function main() {
           if (fs.existsSync(fullVttPath)) {
             const patchedVtt = ensureVttTimestampMap(fs.readFileSync(fullVttPath, 'utf8'));
             fs.writeFileSync(fullVttPath, patchedVtt, 'utf8');
-            const rawSize = fs.statSync(fullVttPath).size;
+            const rawSize = (await fs.promises.stat(fullVttPath)).size;
             console.log(`Subtitle stream #${sub.index} converted to single VTT (${(rawSize / 1024).toFixed(1)} KB)`);
 
             subtitlePlaylists.push({
@@ -1905,7 +1914,7 @@ async function main() {
             try {
               execSync(`zip -0 -j "${zipPath}" -@ < "${listFilePath}"`, { stdio: 'ignore' });
 
-              const zipSize = fs.statSync(zipPath).size;
+              const zipSize = (await fs.promises.stat(zipPath)).size;
               console.log(`Uploading subtitle ZIP ${zipName} (${(zipSize / 1024).toFixed(1)} KB)...`);
               const uploadRes = await uploadAssetWithRotation(zipName, zipPath, 'application/zip');
 
@@ -2022,19 +2031,22 @@ async function main() {
   const audioInitRegex = /^audio_\d+_part\d{4}_init\.mp4$/;
   let audioSegmentStart = null;
   let audioSegmentEnd = null;
-  const audioFilesToZip = fs.readdirSync(OUTPUT_DIR)
-    .filter(name => audioSegRegex.test(name) || audioInitRegex.test(name))
-    .map(name => {
-      const fullPath = path.join(OUTPUT_DIR, name);
-      const size = fs.statSync(fullPath).size;
-      const segMatch = name.match(audioSegRegex);
-      const segmentIndex = segMatch ? parseInt(segMatch[1], 10) : null;
-      if (segmentIndex !== null) {
-        if (audioSegmentStart === null || segmentIndex < audioSegmentStart) audioSegmentStart = segmentIndex;
-        if (audioSegmentEnd === null || segmentIndex > audioSegmentEnd) audioSegmentEnd = segmentIndex;
-      }
-      return { name, fullPath, size };
-    });
+  const audioFilesToZip = await Promise.all(
+    (await fs.promises.readdir(OUTPUT_DIR))
+      .filter(name => audioSegRegex.test(name) || audioInitRegex.test(name))
+      .map(async name => {
+        const fullPath = path.join(OUTPUT_DIR, name);
+        const stat = await fs.promises.stat(fullPath);
+        const size = stat.size;
+        const segMatch = name.match(audioSegRegex);
+        const segmentIndex = segMatch ? parseInt(segMatch[1], 10) : null;
+        if (segmentIndex !== null) {
+          if (audioSegmentStart === null || segmentIndex < audioSegmentStart) audioSegmentStart = segmentIndex;
+          if (audioSegmentEnd === null || segmentIndex > audioSegmentEnd) audioSegmentEnd = segmentIndex;
+        }
+        return { name, fullPath, size };
+      })
+  );
 
   if (audioFilesToZip.length > 0) {
     const zipName = `audio-part${partIndex.toString().padStart(4, '0')}.zip`;
@@ -2049,7 +2061,7 @@ async function main() {
       try { fs.unlinkSync(listFilePath); } catch (e) {}
     }
 
-    const zipSize = fs.statSync(zipPath).size;
+    const zipSize = (await fs.promises.stat(zipPath)).size;
     console.log(`Uploading audio ZIP ${zipName} (${(zipSize / 1024 / 1024).toFixed(2)} MB)...`);
     const uploadRes = await uploadAssetWithRotation(zipName, zipPath, 'application/zip');
 
@@ -2275,28 +2287,34 @@ async function main() {
     const audioSegRegex = /^audio_\d+_(\d{5})\.m4s$/;
     const audioInitRegex = /^audio_\d+_part\d{4}_init\.mp4$/;
 
-    const videoFiles = fs.readdirSync(RES_OUTPUT_DIR)
-      .filter(name => videoSegRegex.test(name) || videoInitRegex.test(name))
-      .map(name => {
-        const fullPath = path.join(RES_OUTPUT_DIR, name);
-        const size = fs.statSync(fullPath).size;
-        const segMatch = name.match(videoSegRegex);
-        const segmentIndex = segMatch ? parseInt(segMatch[1], 10) : null;
-        return { name, fullPath, size, segmentIndex };
-      });
+    const videoFiles = await Promise.all(
+      (await fs.promises.readdir(RES_OUTPUT_DIR))
+        .filter(name => videoSegRegex.test(name) || videoInitRegex.test(name))
+        .map(async name => {
+          const fullPath = path.join(RES_OUTPUT_DIR, name);
+          const stat = await fs.promises.stat(fullPath);
+          const size = stat.size;
+          const segMatch = name.match(videoSegRegex);
+          const segmentIndex = segMatch ? parseInt(segMatch[1], 10) : null;
+          return { name, fullPath, size, segmentIndex };
+        })
+    );
 
-    const audioFiles = fs.readdirSync(OUTPUT_DIR)
-      .filter(name => audioSegRegex.test(name) || audioInitRegex.test(name))
-      .map(name => {
-        const fullPath = path.join(OUTPUT_DIR, name);
-        const size = fs.statSync(fullPath).size;
-        let segmentIndex = null;
-        const audMatch = name.match(audioSegRegex);
-        if (audMatch) {
-          segmentIndex = parseInt(audMatch[1], 10);
-        }
-        return { name, fullPath, size, segmentIndex };
-      });
+    const audioFiles = await Promise.all(
+      (await fs.promises.readdir(OUTPUT_DIR))
+        .filter(name => audioSegRegex.test(name) || audioInitRegex.test(name))
+        .map(async name => {
+          const fullPath = path.join(OUTPUT_DIR, name);
+          const stat = await fs.promises.stat(fullPath);
+          const size = stat.size;
+          let segmentIndex = null;
+          const audMatch = name.match(audioSegRegex);
+          if (audMatch) {
+            segmentIndex = parseInt(audMatch[1], 10);
+          }
+          return { name, fullPath, size, segmentIndex };
+        })
+    );
 
     const filesToZip = [...videoFiles, ...audioFiles];
 
@@ -2340,7 +2358,7 @@ async function main() {
         try { fs.unlinkSync(listFilePath); } catch (e) {}
       }
       
-      const zipSize = fs.statSync(zipPath).size;
+      const zipSize = (await fs.promises.stat(zipPath)).size;
       console.log(`Uploading ${zipName} (${(zipSize / 1024 / 1024).toFixed(1)} MB)...`);
       const uploadRes = await uploadAssetWithRotation(zipName, zipPath, 'application/zip');
       
