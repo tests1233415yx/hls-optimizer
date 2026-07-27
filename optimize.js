@@ -900,92 +900,103 @@ function buildDownloadHeaders(parsed, token) {
   return headers;
 }
 
-function attemptDownload(url, destPath, token) {
+function attemptRangeDownload(url, destPath, token, start, end) {
   return new Promise((resolve, reject) => {
-    let file = null;
+    let fd = null;
     let activeRequest = null;
-    let downloadedBytes = 0;
-    let totalBytes = 0;
     let isRejected = false;
+    let writePos = start;
 
     function cleanupAndReject(err) {
       if (isRejected) return;
       isRejected = true;
-
       if (activeRequest) {
         activeRequests.delete(activeRequest);
         try { activeRequest.destroy(); } catch (e) {}
       }
-      if (file) {
-        file.close(() => {
-          fs.unlink(destPath, () => {});
-        });
-      } else {
-        fs.unlink(destPath, () => {});
+      if (fd !== null) {
+        try { fs.closeSync(fd); } catch (e) {}
+        fd = null;
       }
       reject(err);
     }
 
     function handleResponse(req, res) {
-      res.on('error', (err) => {
-        cleanupAndReject(err);
-      });
+      res.on('error', (err) => cleanupAndReject(err));
 
       if (res.statusCode === 302 || res.statusCode === 301) {
         const loc = res.headers.location;
-        res.resume(); // consume response body
-        activeRequests.delete(req);
-        file.close(() => {
-          if (!loc) {
-            cleanupAndReject(new Error('Redirect location missing'));
-            return;
-          }
-          startDownload(loc);
-        });
-        return;
-      }
-
-      if (res.statusCode !== 200) {
         res.resume();
-        cleanupAndReject(new Error(`Failed to download: status ${res.statusCode}`));
+        activeRequests.delete(req);
+        if (!loc) {
+          cleanupAndReject(new Error('Redirect location missing'));
+          return;
+        }
+        startDownload(loc);
         return;
       }
 
-      totalBytes = parseInt(res.headers['content-length'] || '0', 10);
-      let lastLoggedMB = 0;
+      if (res.statusCode !== 206 && res.statusCode !== 200) {
+        res.resume();
+        cleanupAndReject(new Error(`Failed range download: status ${res.statusCode}`));
+        return;
+      }
+
+      // If the server doesn't honor Range and sends the full body (200), skip to the
+      // requested offset ourselves so we still only persist the requested span.
+      let skipBytes = res.statusCode === 200 ? start : 0;
 
       res.on('data', (chunk) => {
-        downloadedBytes += chunk.length;
-        const currentMB = Math.floor(downloadedBytes / (50 * 1024 * 1024)) * 50;
-        if (currentMB > lastLoggedMB) {
-          lastLoggedMB = currentMB;
-          const percent = totalBytes ? ` (${Math.round((downloadedBytes / totalBytes) * 100)}%)` : '';
-          console.log(`Downloaded ${currentMB} MB${percent}...`);
+        if (isRejected) return;
+        if (skipBytes > 0) {
+          if (chunk.length <= skipBytes) {
+            skipBytes -= chunk.length;
+            return;
+          }
+          chunk = chunk.subarray(skipBytes);
+          skipBytes = 0;
         }
+        if (writePos > end) return;
+        if (writePos + chunk.length - 1 > end) {
+          chunk = chunk.subarray(0, end - writePos + 1);
+        }
+        res.pause();
+        fs.write(fd, chunk, 0, chunk.length, writePos, (err, written) => {
+          if (err) {
+            cleanupAndReject(err);
+            return;
+          }
+          writePos += written;
+          if (!isRejected) res.resume();
+        });
       });
 
-      res.pipe(file);
-
-      file.on('finish', () => {
-        file.close(() => {
-          activeRequests.delete(req);
-          if (totalBytes > 0 && downloadedBytes !== totalBytes) {
-            cleanupAndReject(new Error(`Incomplete download: expected ${totalBytes} bytes, got ${downloadedBytes} bytes`));
-          } else {
-            resolve();
-          }
-        });
+      res.on('end', () => {
+        if (isRejected) return;
+        activeRequests.delete(req);
+        if (fd !== null) {
+          try { fs.closeSync(fd); } catch (e) {}
+          fd = null;
+        }
+        if (writePos - start !== (end - start + 1)) {
+          cleanupAndReject(new Error(`Incomplete range download: expected ${end - start + 1} bytes, got ${writePos - start} bytes`));
+          return;
+        }
+        resolve();
       });
     }
 
     function startDownload(currentUrl) {
       const parsed = new URL(currentUrl);
       const headers = buildDownloadHeaders(parsed, token);
+      headers['Range'] = `bytes=${start}-${end}`;
 
-      file = fs.createWriteStream(destPath);
-      file.on('error', (err) => {
-        cleanupAndReject(err);
-      });
+      try {
+        fd = fs.openSync(destPath, 'r+');
+      } catch (e) {
+        cleanupAndReject(e);
+        return;
+      }
 
       const req = https.get({
         protocol: parsed.protocol,
@@ -993,14 +1004,14 @@ function attemptDownload(url, destPath, token) {
         port: parsed.port,
         path: parsed.pathname + parsed.search,
         headers,
-        timeout: 60000 // 60 seconds inactivity timeout
+        timeout: 60000
       }, (res) => handleResponse(req, res));
 
       activeRequest = req;
       activeRequests.add(req);
 
       req.on('timeout', () => {
-        cleanupAndReject(new Error('Download connection timed out after 60 seconds of inactivity'));
+        cleanupAndReject(new Error('Range download connection timed out after 60 seconds of inactivity'));
       });
 
       req.on('error', (err) => {
@@ -1012,7 +1023,7 @@ function attemptDownload(url, destPath, token) {
   });
 }
 
-function downloadFile(url, destPath, token, maxRetries = 3) {
+function downloadRange(url, destPath, token, start, end, maxRetries = 3) {
   let attempt = 0;
 
   return new Promise((resolve, reject) => {
@@ -1022,17 +1033,17 @@ function downloadFile(url, destPath, token, maxRetries = 3) {
         return;
       }
       attempt++;
-      attemptDownload(url, destPath, token)
+      attemptRangeDownload(url, destPath, token, start, end)
         .then(resolve)
         .catch((err) => {
           if (isGlobalAborted || err.message === 'aborted') {
             reject(err);
             return;
           }
-          console.warn(`[Download] Attempt ${attempt} failed: ${err.message}`);
+          console.warn(`[Range Download] Attempt ${attempt} failed (bytes ${start}-${end}): ${err.message}`);
           if (attempt < maxRetries) {
             const delay = attempt * 2000;
-            console.log(`[Download] Retrying in ${delay}ms...`);
+            console.log(`[Range Download] Retrying in ${delay}ms...`);
             setTimeout(execute, delay);
           } else {
             reject(err);
@@ -1041,6 +1052,35 @@ function downloadFile(url, destPath, token, maxRetries = 3) {
     }
     execute();
   });
+}
+
+// Merge a new [start, end] interval into a sorted list of non-overlapping, coalesced intervals.
+function mergeRange(intervals, start, end) {
+  const next = intervals.concat([[start, end]]).sort((a, b) => a[0] - b[0]);
+  const merged = [];
+  for (const iv of next) {
+    if (merged.length && iv[0] <= merged[merged.length - 1][1] + 1) {
+      merged[merged.length - 1][1] = Math.max(merged[merged.length - 1][1], iv[1]);
+    } else {
+      merged.push(iv.slice());
+    }
+  }
+  return merged;
+}
+
+// Return the sub-ranges of [start, end] not yet covered by `intervals`.
+function findMissingRanges(intervals, start, end) {
+  const missing = [];
+  let cur = start;
+  for (const [s, e] of intervals) {
+    if (e < cur) continue;
+    if (s > end) break;
+    if (s > cur) missing.push([cur, Math.min(s - 1, end)]);
+    cur = Math.max(cur, e + 1);
+    if (cur > end) break;
+  }
+  if (cur <= end) missing.push([cur, end]);
+  return missing;
 }
 
 let isGlobalAborted = false;
@@ -1062,6 +1102,10 @@ const cacheDir = path.join(WORK_DIR, 'cache');
 const activeReads = new Map();
 const chunkAccessOrder = [];
 let MAX_CACHED_CHUNKS = 12;
+// Byte ranges already fetched per part index, e.g. { 3: [[0, 4095], [1048576, 2097151]] }.
+const partRanges = new Map();
+// Serializes range fetches per part so overlapping requests don't race on the same sparse file.
+const partQueue = new Map();
 
 function recordAccess(assetIdx) {
   const idx = chunkAccessOrder.indexOf(assetIdx);
@@ -1100,6 +1144,7 @@ function cleanCache() {
         console.error(`[Proxy Cache] Deleting old cached chunk ${assetIdx} to free up space`);
         try {
           fs.unlinkSync(oldPath);
+          partRanges.delete(assetIdx);
           deletedCount++;
         } catch (e) {
           console.warn(`[Proxy Cache] Failed to delete chunk ${assetIdx}:`, e);
@@ -1109,47 +1154,55 @@ function cleanCache() {
   })();
 }
 
-function getOrDownloadPart(assetIdx, partAssets, token) {
-  recordAccess(assetIdx);
-  const destPath = path.join(cacheDir, `part_${assetIdx}`);
-  
-  if (activeDownloads.has(assetIdx)) {
-    return activeDownloads.get(assetIdx);
-  }
-  
-  if (fs.existsSync(destPath)) {
-    return Promise.resolve(destPath);
-  }
-  
-  console.error(`[Proxy Cache] Starting download of chunk ${assetIdx}...`);
+// Ensures a sparse cache file exists for this part, sized to the full remote part
+// (so byte offsets line up), without pre-filling it — actual bytes are only written
+// for ranges that get downloaded.
+function ensurePartFile(assetIdx, partSize) {
   fs.mkdirSync(cacheDir, { recursive: true });
-  
-  const tmpPath = `${destPath}.tmp`;
-  const promise = downloadFile(partAssets[assetIdx].url, tmpPath, token)
-    .then(() => {
-      try {
-        fs.renameSync(tmpPath, destPath);
-      } catch (err) {
-        console.warn(`[Proxy Cache] Failed to rename ${tmpPath} to ${destPath}:`, err);
-        // Fallback: try to resolve with the tmpPath if rename fails for some permission reasons, 
-        // though destPath is expected.
-        return tmpPath;
-      }
-      console.error(`[Proxy Cache] Finished download of chunk ${assetIdx}`);
+  const destPath = path.join(cacheDir, `part_${assetIdx}`);
+  if (!fs.existsSync(destPath)) {
+    const fd = fs.openSync(destPath, 'w');
+    fs.ftruncateSync(fd, partSize);
+    fs.closeSync(fd);
+    partRanges.delete(assetIdx);
+  }
+  return destPath;
+}
+
+// Ensures [start, end] of the given part is present in the local sparse cache file,
+// fetching only the byte sub-ranges that aren't cached yet (coalescing adjacent/
+// overlapping requests) instead of downloading the whole ~1GB part for a small read.
+function getOrDownloadRange(assetIdx, partAssets, token, start, end) {
+  recordAccess(assetIdx);
+  const partSize = partAssets[assetIdx].size;
+  const destPath = ensurePartFile(assetIdx, partSize);
+
+  const prevTail = partQueue.get(assetIdx) || Promise.resolve();
+  const task = prevTail.then(async () => {
+    const covered = partRanges.get(assetIdx) || [];
+    const missing = findMissingRanges(covered, start, end);
+
+    for (const [mStart, mEnd] of missing) {
+      console.error(`[Proxy Cache] Fetching bytes ${mStart}-${mEnd} of chunk ${assetIdx} (${mEnd - mStart + 1} bytes)...`);
+      await downloadRange(partAssets[assetIdx].url, destPath, token, mStart, mEnd);
+      partRanges.set(assetIdx, mergeRange(partRanges.get(assetIdx) || [], mStart, mEnd));
+    }
+
+    return destPath;
+  });
+
+  activeDownloads.set(assetIdx, task);
+  // Keep the queue alive even if this task fails, so subsequent ranges on this part
+  // aren't permanently blocked by one failed fetch; the caller still sees the rejection.
+  partQueue.set(assetIdx, task.catch(() => {}));
+  task.finally(() => {
+    if (activeDownloads.get(assetIdx) === task) {
       activeDownloads.delete(assetIdx);
-      recordAccess(assetIdx);
       cleanCache();
-      return destPath;
-    })
-    .catch((err) => {
-      activeDownloads.delete(assetIdx);
-      try { fs.unlinkSync(tmpPath); } catch (e) {}
-      try { fs.unlinkSync(destPath); } catch (e) {}
-      throw err;
-    });
-    
-  activeDownloads.set(assetIdx, promise);
-  return promise;
+    }
+  });
+
+  return task;
 }
 
 function createMergedStream(start, end, partAssets, token) {
@@ -1199,14 +1252,15 @@ function createMergedStream(start, end, partAssets, token) {
     openingPart = true;
     const partInfo = partsToRead[currentPartIdx];
     
-    getOrDownloadPart(partInfo.idx, partAssets, token)
+    getOrDownloadRange(partInfo.idx, partAssets, token, partInfo.startInPart, partInfo.endInPart)
       .then((filePath) => {
         if (destroyed) return;
         openingPart = false;
-        
-        // Pre-download next part in background
+
+        // Pre-fetch the next needed range in background
         if (currentPartIdx + 1 < partsToRead.length) {
-          getOrDownloadPart(partsToRead[currentPartIdx + 1].idx, partAssets, token).catch(() => {});
+          const nextPart = partsToRead[currentPartIdx + 1];
+          getOrDownloadRange(nextPart.idx, partAssets, token, nextPart.startInPart, nextPart.endInPart).catch(() => {});
         }
         
         const fsStream = fs.createReadStream(filePath, {
