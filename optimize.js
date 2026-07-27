@@ -906,6 +906,8 @@ function attemptRangeDownload(url, destPath, token, start, end) {
     let activeRequest = null;
     let isRejected = false;
     let writePos = start;
+    let pendingWrites = 0;
+    let streamEnded = false;
 
     function cleanupAndReject(err) {
       if (isRejected) return;
@@ -961,17 +963,23 @@ function attemptRangeDownload(url, destPath, token, start, end) {
           chunk = chunk.subarray(0, end - writePos + 1);
         }
         res.pause();
+        pendingWrites++;
         fs.write(fd, chunk, 0, chunk.length, writePos, (err, written) => {
+          pendingWrites--;
           if (err) {
             cleanupAndReject(err);
             return;
           }
           writePos += written;
           if (!isRejected) res.resume();
+          // 'end' can fire while this write was still in flight (pause() only
+          // suppresses further 'data' emission, it doesn't delay 'end' once the
+          // stream has drained its buffer) — finish up here if that happened.
+          if (streamEnded && pendingWrites === 0) finish();
         });
       });
 
-      res.on('end', () => {
+      function finish() {
         if (isRejected) return;
         activeRequests.delete(req);
         if (fd !== null) {
@@ -983,6 +991,15 @@ function attemptRangeDownload(url, destPath, token, start, end) {
           return;
         }
         resolve();
+      }
+
+      res.on('end', () => {
+        if (isRejected) return;
+        streamEnded = true;
+        // Wait for any writes still in flight; finish() will be invoked by the
+        // last one's callback instead of here (see comment above).
+        if (pendingWrites > 0) return;
+        finish();
       });
     }
 
@@ -1212,12 +1229,17 @@ function getOrDownloadRange(assetIdx, partAssets, token, start, end) {
   // Keep the queue alive even if this task fails, so subsequent ranges on this part
   // aren't permanently blocked by one failed fetch; the caller still sees the rejection.
   partQueue.set(assetIdx, task.catch(() => {}));
+  // .finally() returns its own derived promise that mirrors task's rejection.
+  // task's rejection is already handled by callers (createMergedStream) and by
+  // partQueue's .catch() above, but nobody consumes THIS derived promise, so
+  // without the trailing catch it becomes a second, independent unhandled
+  // rejection that crashes the process even though the "real" one was handled.
   task.finally(() => {
     if (activeDownloads.get(assetIdx) === task) {
       activeDownloads.delete(assetIdx);
       cleanCache();
     }
-  });
+  }).catch(() => {});
 
   return task;
 }
@@ -1381,6 +1403,11 @@ function startCachingProxy(partAssets, token) {
         'Content-Type': 'video/mp4'
       });
       
+      // destroy(err) below re-emits 'error' on res itself; without a listener
+      // here that's a second unhandled 'error' event that crashes the process
+      // even though the mergedStream error right below is already handled.
+      res.on('error', () => {});
+
       const mergedStream = createMergedStream(start, end, partAssets, token);
       // pipe() doesn't forward source 'error' events to the destination, so
       // without this listener a download failure here is an unhandled
