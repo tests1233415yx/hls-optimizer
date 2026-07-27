@@ -1023,7 +1023,13 @@ function attemptRangeDownload(url, destPath, token, start, end) {
   });
 }
 
-function downloadRange(url, destPath, token, start, end, maxRetries = 3) {
+// Large single-range requests (whole video parts can be 500MB+) are more prone to
+// mid-transfer connection resets on GitHub's CDN than smaller ones. Splitting into
+// sub-ranges bounds how much a single connection has to deliver reliably, and lets
+// a reset only cost a retry of its own sub-range instead of the whole part.
+const MAX_SUBRANGE_BYTES = 64 * 1024 * 1024;
+
+function downloadSingleRange(url, destPath, token, start, end, maxRetries) {
   let attempt = 0;
 
   return new Promise((resolve, reject) => {
@@ -1052,6 +1058,17 @@ function downloadRange(url, destPath, token, start, end, maxRetries = 3) {
     }
     execute();
   });
+}
+
+async function downloadRange(url, destPath, token, start, end, maxRetries = 3) {
+  if (end - start + 1 <= MAX_SUBRANGE_BYTES) {
+    return downloadSingleRange(url, destPath, token, start, end, maxRetries);
+  }
+
+  for (let subStart = start; subStart <= end; subStart += MAX_SUBRANGE_BYTES) {
+    const subEnd = Math.min(subStart + MAX_SUBRANGE_BYTES - 1, end);
+    await downloadSingleRange(url, destPath, token, subStart, subEnd, maxRetries);
+  }
 }
 
 // Merge a new [start, end] interval into a sorted list of non-overlapping, coalesced intervals.
@@ -1365,8 +1382,18 @@ function startCachingProxy(partAssets, token) {
       });
       
       const mergedStream = createMergedStream(start, end, partAssets, token);
+      // pipe() doesn't forward source 'error' events to the destination, so
+      // without this listener a download failure here is an unhandled
+      // 'error' event on mergedStream and crashes the whole worker process.
+      mergedStream.on('error', (err) => {
+        console.error(`[Proxy] Merged stream error: ${err.message}`);
+        if (!res.headersSent) {
+          res.writeHead(502);
+        }
+        res.destroy(err);
+      });
       mergedStream.pipe(res);
-      
+
       req.on('close', () => {
         mergedStream.destroy();
       });
