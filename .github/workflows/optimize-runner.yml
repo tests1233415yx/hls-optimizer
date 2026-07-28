@@ -88,6 +88,9 @@ jobs:
           mkdir -p "$WORKDIR"
           echo "HLS_WORK_DIR=$WORKDIR" >> "$GITHUB_ENV"
 
+          # Clean up any stale hls-worker-* directories from previous crashed or killed runs
+          find "$WORKDIR" -mindepth 1 -maxdepth 1 -type d -name "hls-worker-*" -mmin +60 -exec rm -rf {} + 2>/dev/null || true
+
           MOUNT_TYPE=$(df -T "$WORKDIR" | awk 'NR==2 {print $2}')
           echo "Work dir: $WORKDIR (fstype: $MOUNT_TYPE)"
           if [ "$MOUNT_TYPE" = "tmpfs" ]; then
@@ -100,3 +103,10 @@ jobs:
           PRIVATE_REPO_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
         run: |
           node optimize.js
+      - name: Cleanup work directory
+        if: always()
+        run: |
+          if [ -n "$HLS_WORK_DIR" ] && [ -d "$HLS_WORK_DIR" ]; then
+            echo "Cleaning up work directory: $HLS_WORK_DIR"
+            rm -rf "$HLS_WORK_DIR/hls-worker-"* 2>/dev/null || true
+          fi

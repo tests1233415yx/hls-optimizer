@@ -1135,7 +1135,7 @@ function abortAllDownloads() {
 const cacheDir = path.join(WORK_DIR, 'cache');
 const activeReads = new Map();
 const chunkAccessOrder = [];
-let MAX_CACHED_CHUNKS = 12;
+let MAX_CACHED_CHUNKS = parseInt(process.env.MAX_CACHED_CHUNKS || '4', 10);
 // Byte ranges already fetched per part index, e.g. { 3: [[0, 4095], [1048576, 2097151]] }.
 const partRanges = new Map();
 // Serializes range fetches per part so overlapping requests don't race on the same sparse file.
@@ -1192,6 +1192,7 @@ function cleanCache() {
 // (so byte offsets line up), without pre-filling it — actual bytes are only written
 // for ranges that get downloaded.
 function ensurePartFile(assetIdx, partSize) {
+  cleanCache();
   fs.mkdirSync(cacheDir, { recursive: true });
   const destPath = path.join(cacheDir, `part_${assetIdx}`);
   if (!fs.existsSync(destPath)) {
@@ -1372,7 +1373,9 @@ function createMergedStream(start, end, partAssets, token) {
 function startCachingProxy(partAssets, token) {
   return new Promise((resolve, reject) => {
     const totalSize = partAssets.reduce((acc, a) => acc + a.size, 0);
-    MAX_CACHED_CHUNKS = Math.max(12, Math.min(partAssets.length, 30));
+    const envMax = process.env.MAX_CACHED_CHUNKS ? parseInt(process.env.MAX_CACHED_CHUNKS, 10) : 4;
+    const defaultCap = isNaN(envMax) ? 4 : envMax;
+    MAX_CACHED_CHUNKS = Math.max(1, Math.min(partAssets.length, defaultCap));
     console.log(`[Proxy] Dynamically set MAX_CACHED_CHUNKS to ${MAX_CACHED_CHUNKS} for ${partAssets.length} remote chunks.`);
 
     const server = http.createServer((req, res) => {
@@ -2827,7 +2830,24 @@ async function main() {
   }
 }
 
+function cleanupWorkDirSync() {
+  try {
+    if (WORK_DIR && fs.existsSync(WORK_DIR)) {
+      fs.rmSync(WORK_DIR, { recursive: true, force: true });
+    }
+  } catch (e) {}
+}
+
+process.on('SIGINT', () => { cleanupWorkDirSync(); process.exit(130); });
+process.on('SIGTERM', () => { cleanupWorkDirSync(); process.exit(143); });
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught Exception:', err);
+  cleanupWorkDirSync();
+  process.exit(1);
+});
+
 main().catch(err => {
   console.error('Unhandled Fatal Error outside main try-catch:', err);
+  cleanupWorkDirSync();
   process.exit(1);
 });
