@@ -1442,6 +1442,120 @@ function startCachingProxy(partAssets, token) {
   });
 }
 
+// Definitive container field_order values (ffmpeg/ffprobe).
+// progressive → skip deinterlace; tt/bb/tb/bt → deinterlace; anything else → sample with idet.
+function fieldOrderImpliesInterlaced(fieldOrder) {
+  if (!fieldOrder) return null;
+  const fo = String(fieldOrder).toLowerCase().trim();
+  if (fo === 'progressive') return false;
+  if (fo === 'tt' || fo === 'bb' || fo === 'tb' || fo === 'bt') return true;
+  return null; // unknown / not coded / etc.
+}
+
+function parseIdetMultiFrameStats(stderr) {
+  // Multi frame detection: TFF:   12 BFF:    0 Progressive:  148 Undetermined:    0
+  const re = /Multi frame detection:\s*TFF:\s*(\d+)\s*BFF:\s*(\d+)\s*Progressive:\s*(\d+)\s*Undetermined:\s*(\d+)/i;
+  const m = re.exec(stderr);
+  if (!m) return null;
+  return {
+    tff: parseInt(m[1], 10),
+    bff: parseInt(m[2], 10),
+    progressive: parseInt(m[3], 10),
+    undetermined: parseInt(m[4], 10),
+  };
+}
+
+// Only return false (skip bwdif) when progressive clearly dominates.
+// Ambiguous / sparse samples return true so we keep quality-safe deinterlace.
+function isConfidentlyProgressiveFromIdet(stats) {
+  if (!stats) return false;
+  const interlaced = stats.tff + stats.bff;
+  const progressive = stats.progressive;
+  const determined = interlaced + progressive;
+  // Need a usable sample; undetermined-only is not reliable.
+  if (determined < 12) return false;
+  // Strong progressive majority: at least 2:1 and progressive is the bulk of determined frames.
+  return progressive >= interlaced * 2 && progressive / determined >= 0.75;
+}
+
+// Short idet pass on a downscaled window of this part. Cheap compared to a full encode;
+// only used when field_order is not definitive.
+function sampleInterlaceWithIdet(inputSource, startTime, sampleSeconds = 3) {
+  return new Promise((resolve) => {
+    const args = ['-nostdin'];
+    if (startTime > 0) {
+      args.push('-ss', startTime.toFixed(3));
+    }
+    args.push(
+      '-analyzeduration', '10M',
+      '-probesize', '10M',
+      '-protocol_whitelist', 'file,http,tcp,https,tls',
+      '-i', inputSource,
+      '-t', String(sampleSeconds),
+      '-an',
+      '-vf', 'scale=-2:360,idet',
+      '-f', 'null',
+      '-'
+    );
+
+    console.log(`Sampling interlace with idet: ffmpeg ${args.join(' ')}`);
+    const child = spawn('ffmpeg', args);
+    let stderr = '';
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk.toString();
+    });
+    child.on('close', () => {
+      const stats = parseIdetMultiFrameStats(stderr);
+      if (stats) {
+        console.log(
+          `idet multi-frame: TFF=${stats.tff} BFF=${stats.bff} Progressive=${stats.progressive} Undetermined=${stats.undetermined}`
+        );
+      } else {
+        console.warn('idet: could not parse Multi frame detection stats from ffmpeg stderr');
+      }
+      resolve(stats);
+    });
+    child.on('error', (err) => {
+      console.warn('Error during idet interlace sample:', err.message || err);
+      resolve(null);
+    });
+  });
+}
+
+/**
+ * Decide whether to run bwdif on compressed encodes.
+ * Only skip when we are confident the source is progressive (field_order or strong idet).
+ * On any uncertainty, return true (keep bwdif) — false negative causes combing artifacts.
+ */
+async function shouldApplyBwdif(inputSource, videoStream, startTime) {
+  const fieldOrder = videoStream && videoStream.field_order;
+  const fromMeta = fieldOrderImpliesInterlaced(fieldOrder);
+  if (fromMeta === false) {
+    console.log(`Deinterlace: field_order=${fieldOrder} → progressive, skipping bwdif`);
+    return false;
+  }
+  if (fromMeta === true) {
+    console.log(`Deinterlace: field_order=${fieldOrder} → interlaced, applying bwdif`);
+    return true;
+  }
+
+  console.log(
+    `Deinterlace: field_order=${fieldOrder || 'missing'} not definitive; sampling with idet...`
+  );
+  const stats = await sampleInterlaceWithIdet(inputSource, startTime, 3);
+  if (isConfidentlyProgressiveFromIdet(stats)) {
+    console.log('Deinterlace: idet confident progressive → skipping bwdif');
+    return false;
+  }
+  console.log('Deinterlace: idet inconclusive or interlaced → applying bwdif (quality-safe default)');
+  return true;
+}
+
+function buildScaleVf(targetHeight, applyBwdif) {
+  const scale = `scale='trunc(oh*a/2)*2':'trunc(min(${targetHeight},ih)/2)*2'`;
+  return applyBwdif ? `bwdif,${scale}` : scale;
+}
+
 function detectSceneCuts(inputSource, startTime, endTime) {
   return new Promise((resolve) => {
     const args = ['-nostdin'];
@@ -1741,7 +1855,7 @@ async function main() {
 
   // 5. Probe video stream properties
   console.log('Probing video stream properties...');
-  const probeCmd = `ffprobe -v error -analyzeduration 100M -probesize 100M -show_entries "format=duration,size,bit_rate:stream=index,codec_type,codec_name,width,height,channels,r_frame_rate,bit_rate:stream_tags" -of json -protocol_whitelist file,http,tcp,https,tls "${inputSource}"`;
+  const probeCmd = `ffprobe -v error -analyzeduration 100M -probesize 100M -show_entries "format=duration,size,bit_rate:stream=index,codec_type,codec_name,width,height,channels,r_frame_rate,bit_rate,field_order:stream_tags" -of json -protocol_whitelist file,http,tcp,https,tls "${inputSource}"`;
   const probeData = JSON.parse(await execAsync(probeCmd, { maxBuffer: 100 * 1024 * 1024 }));
 
   const videoStream = probeData.streams.find(s => s.codec_type === 'video');
@@ -2243,7 +2357,16 @@ async function main() {
 
 
   let forcedKeyframeString = null;
+  // Default true: quality-safe if detection is skipped (audio/subs/original) or fails open.
+  let applyBwdif = true;
   if (kind !== 'original' && !isAudioJob && !isSubtitlesJob) {
+    try {
+      applyBwdif = await shouldApplyBwdif(inputSource, videoStream, startTime);
+    } catch (e) {
+      console.warn('Interlace detection failed, keeping bwdif:', e.message || e);
+      applyBwdif = true;
+    }
+
     console.log('Pre-analysis: Detecting scene cuts for aligned keyframe placement...');
     try {
       const chunkDuration = (endTime !== null ? endTime : duration) - startTime;
@@ -2376,6 +2499,9 @@ async function main() {
       );
       console.log(`Dynamic params adjusted for ${codec}: CRF=${dynamicParams.crf}, Preset=${dynamicParams.preset}, Maxrate=${dynamicParams.maxrate || 'N/A'}, Bufsize=${dynamicParams.bufsize || 'N/A'}`);
 
+      const vfChain = buildScaleVf(tHeight, applyBwdif);
+      console.log(`Video filter chain for ${codec}: ${vfChain}`);
+
       if (codec === 'h264') {
         ffmpegArgs.push(
           '-c:v', 'libx264',
@@ -2390,7 +2516,7 @@ async function main() {
         if (hls_level) ffmpegArgs.push('-level', hls_level);
         ffmpegArgs.push(
           '-pix_fmt', 'yuv420p',
-          '-vf', `"bwdif,scale='trunc(oh*a/2)*2':'trunc(min(${tHeight},ih)/2)*2'"`,
+          '-vf', `"${vfChain}"`,
           '-force_key_frames', forcedKeyframeString ? `"${forcedKeyframeString}"` : '"expr:gte(t,n_forced*6)"',
           '-sc_threshold', '0',
           '-flags', '+cgop'
@@ -2421,7 +2547,7 @@ async function main() {
           ffmpegArgs.push('-bufsize', dynamicParams.bufsize);
         }
         ffmpegArgs.push(
-          '-vf', `"bwdif,scale='trunc(oh*a/2)*2':'trunc(min(${tHeight},ih)/2)*2'"`
+          '-vf', `"${vfChain}"`
         );
         if (forcedKeyframeString) {
           ffmpegArgs.push('-force_key_frames', `"${forcedKeyframeString}"`);
