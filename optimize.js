@@ -2151,96 +2151,93 @@ async function main() {
           title: aud.title,
           playlistText: rawAudPlaylist
         });
-      } catch (err) {
-        console.warn(`Warning: Failed to convert audio stream #${aud.index}. Skipping.`);
-      }
-    }
-  }
 
-  // Zip audio files separately, one zip per audio stream (mirrors subtitle per-stream
-  // zipping), chunked so no single zip exceeds MAX_ZIP_BYTES (runs on metadata/audio
-  // runner or primary runner VM).
-  const audioSegRegex = /^audio_(\d+)_(\d{5})\.m4s$/;
-  const audioInitRegex = /^audio_(\d+)_part\d{4}_init\.mp4$/;
-  const audioFilesByStream = new Map();
-  for (const name of await fs.promises.readdir(OUTPUT_DIR)) {
-    const segMatch = name.match(audioSegRegex);
-    const initMatch = name.match(audioInitRegex);
-    if (!segMatch && !initMatch) continue;
-    const streamIdx = parseInt((segMatch || initMatch)[1], 10);
-    const segmentIndex = segMatch ? parseInt(segMatch[2], 10) : null;
-    const fullPath = path.join(OUTPUT_DIR, name);
-    const size = (await fs.promises.stat(fullPath)).size;
-    if (!audioFilesByStream.has(streamIdx)) audioFilesByStream.set(streamIdx, []);
-    audioFilesByStream.get(streamIdx).push({ name, fullPath, size, segmentIndex });
-  }
+        // Immediately zip, upload, and delete segments for THIS audio track
+        // keeping disk storage and RAM low before proceeding to the next track.
+        const streamIdx = aud.index;
+        const audioSegRegex = new RegExp(`^audio_${streamIdx}_(\\d{5})\\.m4s$`);
+        const audioInitRegex = new RegExp(`^audio_${streamIdx}_part\\d{4}_init\\.mp4$`);
+        
+        const trackFiles = [];
+        for (const name of await fs.promises.readdir(OUTPUT_DIR)) {
+          const segMatch = name.match(audioSegRegex);
+          const initMatch = name.match(audioInitRegex);
+          if (!segMatch && !initMatch) continue;
+          const segmentIndex = segMatch ? parseInt(segMatch[1], 10) : null;
+          const fullPath = path.join(OUTPUT_DIR, name);
+          const size = (await fs.promises.stat(fullPath)).size;
+          trackFiles.push({ name, fullPath, size, segmentIndex });
+        }
 
-  for (const [streamIdx, files] of audioFilesByStream) {
-    files.sort((a, b) => {
-      const isInitA = a.name.includes('init');
-      const isInitB = b.name.includes('init');
-      if (isInitA && !isInitB) return -1;
-      if (!isInitA && isInitB) return 1;
-      return (a.segmentIndex ?? -1) - (b.segmentIndex ?? -1);
-    });
+        trackFiles.sort((a, b) => {
+          const isInitA = a.name.includes('init');
+          const isInitB = b.name.includes('init');
+          if (isInitA && !isInitB) return -1;
+          if (!isInitA && isInitB) return 1;
+          return (a.segmentIndex ?? -1) - (b.segmentIndex ?? -1);
+        });
 
-    let pendingFiles = [];
-    let pendingSize = 0;
-    let segmentStart = null;
-    let segmentEnd = null;
-    let chunkIdx = 0;
+        let pendingFiles = [];
+        let pendingSize = 0;
+        let segmentStart = null;
+        let segmentEnd = null;
+        let chunkIdx = 0;
 
-    const flush = async () => {
-      if (pendingFiles.length === 0) return;
-      const zipName = `audio-${streamIdx}-part${partIndex.toString().padStart(4, '0')}-${chunkIdx.toString().padStart(4, '0')}.zip`;
-      const zipPath = path.join(WORK_DIR, zipName);
-      console.log(`Packaging audio ZIP ${zipName} with ${pendingFiles.length} files...`);
-      const listFilePath = path.join(WORK_DIR, `${zipName}.list.txt`);
-      fs.writeFileSync(listFilePath, pendingFiles.map(f => f.fullPath).join('\n'), 'utf8');
-      try {
-        execSync(`zip -0 -j "${zipPath}" -@ < "${listFilePath}"`, { stdio: 'ignore' });
-      } finally {
-        try { fs.unlinkSync(listFilePath); } catch (e) {}
-      }
+        const flush = async () => {
+          if (pendingFiles.length === 0) return;
+          const zipName = `audio-${streamIdx}-part${partIndex.toString().padStart(4, '0')}-${chunkIdx.toString().padStart(4, '0')}.zip`;
+          const zipPath = path.join(WORK_DIR, zipName);
+          console.log(`Packaging audio ZIP ${zipName} with ${pendingFiles.length} files...`);
+          const listFilePath = path.join(WORK_DIR, `${zipName}.list.txt`);
+          fs.writeFileSync(listFilePath, pendingFiles.map(f => f.fullPath).join('\n'), 'utf8');
+          try {
+            execSync(`zip -0 -j "${zipPath}" -@ < "${listFilePath}"`, { stdio: 'ignore' });
+          } finally {
+            try { fs.unlinkSync(listFilePath); } catch (e) {}
+          }
 
-      const zipSize = (await fs.promises.stat(zipPath)).size;
-      console.log(`Uploading audio ZIP ${zipName} (${(zipSize / 1024 / 1024).toFixed(2)} MB)...`);
-      const uploadRes = await uploadAssetWithRotation(zipName, zipPath, 'application/zip');
+          const zipSize = (await fs.promises.stat(zipPath)).size;
+          console.log(`Uploading audio ZIP ${zipName} (${(zipSize / 1024 / 1024).toFixed(2)} MB)...`);
+          const uploadRes = await uploadAssetWithRotation(zipName, zipPath, 'application/zip');
 
-      completedSubtitleZips.push({
-        zipType: 'audio',
-        streamIndex: streamIdx,
-        zipIndex: chunkIdx,
-        assetId: uploadRes.id,
-        url: uploadRes.browser_download_url,
-        zipSize,
-        segmentStart,
-        segmentEnd
-      });
+          completedSubtitleZips.push({
+            zipType: 'audio',
+            streamIndex: streamIdx,
+            zipIndex: chunkIdx,
+            assetId: uploadRes.id,
+            url: uploadRes.browser_download_url,
+            zipSize,
+            segmentStart,
+            segmentEnd
+          });
 
-      fs.unlinkSync(zipPath);
-      for (const f of pendingFiles) {
-        try { fs.unlinkSync(f.fullPath); } catch (e) {}
-      }
-      pendingFiles = [];
-      pendingSize = 0;
-      segmentStart = null;
-      segmentEnd = null;
-      chunkIdx++;
-    };
+          fs.unlinkSync(zipPath);
+          for (const f of pendingFiles) {
+            try { fs.unlinkSync(f.fullPath); } catch (e) {}
+          }
+          pendingFiles = [];
+          pendingSize = 0;
+          segmentStart = null;
+          segmentEnd = null;
+          chunkIdx++;
+        };
 
-    for (const f of files) {
-      if (pendingSize + f.size > MAX_ZIP_BYTES && pendingFiles.length > 0) {
+        for (const f of trackFiles) {
+          if (pendingSize + f.size > MAX_ZIP_BYTES && pendingFiles.length > 0) {
+            await flush();
+          }
+          pendingFiles.push(f);
+          pendingSize += f.size;
+          if (f.segmentIndex !== null) {
+            if (segmentStart === null || f.segmentIndex < segmentStart) segmentStart = f.segmentIndex;
+            if (segmentEnd === null || f.segmentIndex > segmentEnd) segmentEnd = f.segmentIndex;
+          }
+        }
         await flush();
-      }
-      pendingFiles.push(f);
-      pendingSize += f.size;
-      if (f.segmentIndex !== null) {
-        if (segmentStart === null || f.segmentIndex < segmentStart) segmentStart = f.segmentIndex;
-        if (segmentEnd === null || f.segmentIndex > segmentEnd) segmentEnd = f.segmentIndex;
+      } catch (err) {
+        console.warn(`Warning: Failed to convert audio stream #${aud.index}: ${err.message}. Skipping.`);
       }
     }
-    await flush();
   }
 
 
