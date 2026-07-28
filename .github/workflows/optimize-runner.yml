@@ -79,23 +79,15 @@ jobs:
           fi
       - name: Configure work directory
         run: |
-          # Point downloads/cache/HLS output at the runner user's home dir instead of
-          # wherever RUNNER_TEMP/tmp resolves to. On some VPS images /tmp (and anything
-          # under it, including RUNNER_TEMP) is mounted as tmpfs, which means multi-GB
-          # source chunks and encoder output would silently be written into RAM instead
-          # of disk, competing with ffmpeg for the same memory.
-          WORKDIR="$HOME/hls-work"
+          # Use RUNNER_TEMP, which is native to each self-hosted runner instance
+          # (e.g., /root/actions-runner-1/_work/_temp). This guarantees complete
+          # isolation between runner agents on the same VPS without littering $HOME.
+          # Append run, matrix chunk, resolution, and part index details so parallel
+          # jobs never collide or wipe each other's cache/work directories during post-cleanup.
+          WORKDIR="${RUNNER_TEMP:-/tmp}/hls-work-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${{ matrix.chunk_index }}-${{ matrix.resolution.label }}-P${{ matrix.part.part_index }}"
           mkdir -p "$WORKDIR"
           echo "HLS_WORK_DIR=$WORKDIR" >> "$GITHUB_ENV"
-
-          # Clean up any stale hls-worker-* directories from previous crashed or killed runs
-          find "$WORKDIR" -mindepth 1 -maxdepth 1 -type d -name "hls-worker-*" -mmin +60 -exec rm -rf {} + 2>/dev/null || true
-
-          MOUNT_TYPE=$(df -T "$WORKDIR" | awk 'NR==2 {print $2}')
-          echo "Work dir: $WORKDIR (fstype: $MOUNT_TYPE)"
-          if [ "$MOUNT_TYPE" = "tmpfs" ]; then
-            echo "::warning::$WORKDIR is on a tmpfs mount - it's RAM-backed, not disk. Encoding may still OOM."
-          fi
+          echo "Work dir: $WORKDIR"
       - name: Run HLS Optimizer
         env:
           ACTIVE_RESOLUTION_LABEL: ${{ matrix.resolution.label }}
@@ -108,5 +100,5 @@ jobs:
         run: |
           if [ -n "$HLS_WORK_DIR" ] && [ -d "$HLS_WORK_DIR" ]; then
             echo "Cleaning up work directory: $HLS_WORK_DIR"
-            rm -rf "$HLS_WORK_DIR/hls-worker-"* 2>/dev/null || true
+            rm -rf "$HLS_WORK_DIR" 2>/dev/null || true
           fi

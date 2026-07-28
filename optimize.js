@@ -1292,9 +1292,25 @@ function createMergedStream(start, end, partAssets, token) {
     openingPart = true;
     const partInfo = partsToRead[currentPartIdx];
     
+    activeReads.set(partInfo.idx, (activeReads.get(partInfo.idx) || 0) + 1);
+    let decremented = false;
+    const decrementRead = () => {
+      if (decremented) return;
+      decremented = true;
+      const count = activeReads.get(partInfo.idx) || 0;
+      if (count <= 1) {
+        activeReads.delete(partInfo.idx);
+      } else {
+        activeReads.set(partInfo.idx, count - 1);
+      }
+    };
+
     getOrDownloadRange(partInfo.idx, partAssets, token, partInfo.startInPart, partInfo.endInPart)
       .then((filePath) => {
-        if (destroyed) return;
+        if (destroyed) {
+          decrementRead();
+          return;
+        }
         openingPart = false;
 
         // Pre-fetch the next needed range in background
@@ -1309,19 +1325,6 @@ function createMergedStream(start, end, partAssets, token) {
         });
         
         currentFileStream = fsStream;
-        
-        activeReads.set(partInfo.idx, (activeReads.get(partInfo.idx) || 0) + 1);
-        let decremented = false;
-        const decrementRead = () => {
-          if (decremented) return;
-          decremented = true;
-          const count = activeReads.get(partInfo.idx) || 0;
-          if (count <= 1) {
-            activeReads.delete(partInfo.idx);
-          } else {
-            activeReads.set(partInfo.idx, count - 1);
-          }
-        };
         
         fsStream.on('data', (chunk) => {
           if (destroyed) {
@@ -1350,6 +1353,7 @@ function createMergedStream(start, end, partAssets, token) {
         });
       })
       .catch((err) => {
+        decrementRead();
         stream.destroy(err);
       });
   }
@@ -1556,36 +1560,42 @@ async function main() {
   const vps_callback_url = vps ? vps.callback_url : flat_vps_callback_url;
   const vps_callback_token = vps ? vps.callback_token : flat_vps_callback_token;
 
+  let activePart = null;
   try {
-    const hls_audio_bitrate = (vps && vps.audio_bitrate !== undefined) ? parseInt(vps.audio_bitrate, 10) : 192;
-  const subtitle_metadata = vps ? vps.subtitle_metadata : undefined;
+    if (process.env.ACTIVE_PART) {
+      activePart = JSON.parse(process.env.ACTIVE_PART);
+    }
+  } catch (e) {}
 
-  // Propagate HLS limits from vps payload to environment variables for dynamic clamping
-  if (vps) {
-    if (vps.av1_slowest_preset_limit !== undefined) process.env.HLS_AV1_SLOWEST_PRESET_LIMIT = String(vps.av1_slowest_preset_limit);
-    if (vps.av1_fastest_preset_limit !== undefined) process.env.HLS_AV1_FASTEST_PRESET_LIMIT = String(vps.av1_fastest_preset_limit);
-    if (vps.h264_slowest_preset_limit !== undefined) process.env.HLS_H264_SLOWEST_PRESET_LIMIT = String(vps.h264_slowest_preset_limit);
-    if (vps.h264_fastest_preset_limit !== undefined) process.env.HLS_H264_FASTEST_PRESET_LIMIT = String(vps.h264_fastest_preset_limit);
-    if (vps.av1_min_crf_limit !== undefined) process.env.HLS_AV1_MIN_CRF_LIMIT = String(vps.av1_min_crf_limit);
-    if (vps.av1_max_crf_limit !== undefined) process.env.HLS_AV1_MAX_CRF_LIMIT = String(vps.av1_max_crf_limit);
-    if (vps.h264_min_crf_limit !== undefined) process.env.HLS_H264_MIN_CRF_LIMIT = String(vps.h264_min_crf_limit);
-    if (vps.h264_max_crf_limit !== undefined) process.env.HLS_H264_MAX_CRF_LIMIT = String(vps.h264_max_crf_limit);
-  }
-
-  const activePart = process.env.ACTIVE_PART ? JSON.parse(process.env.ACTIVE_PART) : null;
-
-  const startTime = activePart && activePart.start_time !== undefined 
-    ? parseFloat(activePart.start_time) 
-    : (data.start_time !== undefined ? parseFloat(data.start_time) : 0);
-  const endTime = activePart && activePart.end_time !== undefined 
-    ? (activePart.end_time !== null ? parseFloat(activePart.end_time) : null) 
-    : (data.end_time !== undefined && data.end_time !== null ? parseFloat(data.end_time) : null);
-  const startSegmentIndex = activePart && activePart.start_segment_index !== undefined 
-    ? parseInt(activePart.start_segment_index, 10) 
-    : (data.start_segment_index !== undefined ? parseInt(data.start_segment_index, 10) : 0);
   const partIndex = activePart && activePart.part_index !== undefined 
     ? parseInt(activePart.part_index, 10) 
     : (data.part_index !== undefined ? parseInt(data.part_index, 10) : 1);
+
+  try {
+    const hls_audio_bitrate = (vps && vps.audio_bitrate !== undefined) ? parseInt(vps.audio_bitrate, 10) : 192;
+    const subtitle_metadata = vps ? vps.subtitle_metadata : undefined;
+
+    // Propagate HLS limits from vps payload to environment variables for dynamic clamping
+    if (vps) {
+      if (vps.av1_slowest_preset_limit !== undefined) process.env.HLS_AV1_SLOWEST_PRESET_LIMIT = String(vps.av1_slowest_preset_limit);
+      if (vps.av1_fastest_preset_limit !== undefined) process.env.HLS_AV1_FASTEST_PRESET_LIMIT = String(vps.av1_fastest_preset_limit);
+      if (vps.h264_slowest_preset_limit !== undefined) process.env.HLS_H264_SLOWEST_PRESET_LIMIT = String(vps.h264_slowest_preset_limit);
+      if (vps.h264_fastest_preset_limit !== undefined) process.env.HLS_H264_FASTEST_PRESET_LIMIT = String(vps.h264_fastest_preset_limit);
+      if (vps.av1_min_crf_limit !== undefined) process.env.HLS_AV1_MIN_CRF_LIMIT = String(vps.av1_min_crf_limit);
+      if (vps.av1_max_crf_limit !== undefined) process.env.HLS_AV1_MAX_CRF_LIMIT = String(vps.av1_max_crf_limit);
+      if (vps.h264_min_crf_limit !== undefined) process.env.HLS_H264_MIN_CRF_LIMIT = String(vps.h264_min_crf_limit);
+      if (vps.h264_max_crf_limit !== undefined) process.env.HLS_H264_MAX_CRF_LIMIT = String(vps.h264_max_crf_limit);
+    }
+
+    const startTime = activePart && activePart.start_time !== undefined 
+      ? parseFloat(activePart.start_time) 
+      : (data.start_time !== undefined ? parseFloat(data.start_time) : 0);
+    const endTime = activePart && activePart.end_time !== undefined 
+      ? (activePart.end_time !== null ? parseFloat(activePart.end_time) : null) 
+      : (data.end_time !== undefined && data.end_time !== null ? parseFloat(data.end_time) : null);
+    const startSegmentIndex = activePart && activePart.start_segment_index !== undefined 
+      ? parseInt(activePart.start_segment_index, 10) 
+      : (data.start_segment_index !== undefined ? parseInt(data.start_segment_index, 10) : 0);
   // If dedicated metadata runner is configured in rawResolutions, only that runner should extract subtitles and audio.
   // Otherwise (e.g., local execution), the primary resolution runner handles it.
   const rawResolutions = data.resolutions || [
