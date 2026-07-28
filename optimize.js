@@ -2505,9 +2505,7 @@ async function main() {
       if (pendingFiles.length === 0) return;
       
       const uniqueZipIndex = (partIndex - 1) * 100 + currentZipIndex;
-      const zipName = useCodecSuffix 
-        ? `segments-${label}-${codec}-part${partIndex.toString().padStart(4, '0')}-${currentZipIndex.toString().padStart(4, '0')}.zip`
-        : `segments-${label}-part${partIndex.toString().padStart(4, '0')}-${currentZipIndex.toString().padStart(4, '0')}.zip`;
+      const zipName = `segments-${label}-${codec}-part${partIndex.toString().padStart(4, '0')}-${currentZipIndex.toString().padStart(4, '0')}.zip`;
       const zipPath = path.join(WORK_DIR, zipName);
       
       console.log(`Packaging ZIP ${zipName} with ${pendingFiles.length} segments...`);
