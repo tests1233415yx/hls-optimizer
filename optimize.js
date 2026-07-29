@@ -1557,17 +1557,17 @@ function sampleInterlaceWithIdet(inputSource, startTime, sampleSeconds = 3) {
 async function shouldApplyBwdif(inputSource, videoStream, startTime) {
   const fieldOrder = videoStream && videoStream.field_order;
   const fromMeta = fieldOrderImpliesInterlaced(fieldOrder);
-  if (fromMeta === false) {
-    console.log(`Deinterlace: field_order=${fieldOrder} → progressive, skipping bwdif`);
-    return false;
-  }
   if (fromMeta === true) {
     console.log(`Deinterlace: field_order=${fieldOrder} → interlaced, applying bwdif`);
     return true;
   }
 
+  // Note: field_order=progressive is NOT trusted on its own — old/rewrapped rips
+  // (esp. old anime/TV sources) routinely mislabel telecined or interlaced content
+  // as progressive in the container. Always confirm with an idet sample instead of
+  // skipping bwdif outright on metadata alone.
   console.log(
-    `Deinterlace: field_order=${fieldOrder || 'missing'} not definitive; sampling with idet...`
+    `Deinterlace: field_order=${fieldOrder || 'missing'} not trusted alone; sampling with idet...`
   );
   const stats = await sampleInterlaceWithIdet(inputSource, startTime, 3);
   if (isConfidentlyProgressiveFromIdet(stats)) {
