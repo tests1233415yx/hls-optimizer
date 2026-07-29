@@ -1690,9 +1690,29 @@ async function runIdetSample(inputSource, seekSeconds, sampleSeconds) {
   return stats;
 }
 
-async function sampleInterlaceWithIdet(inputSource, startTime, sampleSeconds = 10) {
-  // Dense windows: logos at 0 often lie (clean progressive card); body may differ.
-  const offsets = [0, 12, 45, 120, 240];
+// Spread N sample windows across [0, span] (relative to startTime), always including 0
+// (logo/OP frame) plus evenly-paced points through the rest of the episode/chunk — so a
+// cadence break mid-episode (scene change, OP/ED, effects shot) isn't missed just because
+// it falls outside a few fixed near-start offsets.
+function buildSpreadOffsets(span, sampleSeconds, minWindows, maxWindows) {
+  if (!span || span <= sampleSeconds) return [0];
+  const approx = Math.round(span / 60);
+  const numWindows = Math.max(minWindows, Math.min(maxWindows, approx));
+  const usableSpan = Math.max(0, span - sampleSeconds);
+  const offsets = [0];
+  for (let i = 1; i < numWindows; i++) {
+    offsets.push(Math.round((i * usableSpan) / (numWindows - 1)));
+  }
+  return [...new Set(offsets)].sort((a, b) => a - b);
+}
+
+async function sampleInterlaceWithIdet(inputSource, startTime, sampleSeconds = 10, endTime = null) {
+  // Dense windows spread across the full episode/chunk instead of only the first few
+  // minutes — cadence/combing can change well past 240s.
+  const span = endTime !== null ? Math.max(0, endTime - startTime) : null;
+  const offsets = span !== null
+    ? buildSpreadOffsets(span, sampleSeconds, 5, 12)
+    : [0, 12, 45, 120, 240];
   let merged = { tff: 0, bff: 0, progressive: 0, undetermined: 0 };
   let any = false;
   let progHits = 0;
@@ -1769,8 +1789,14 @@ async function probeTelecineWindow(inputSource, seek, parity, sampleSeconds = 8)
   return { ok: isTc, ratio, rawFrames, ivtcFrames };
 }
 
-async function probeTelecine(inputSource, startTime, parity) {
-  const seeks = [Math.max(0, startTime + 20), Math.max(0, startTime + 90)];
+async function probeTelecine(inputSource, startTime, parity, endTime = null) {
+  // Spread telecine-ratio checks across the whole episode/chunk (not just +20s/+90s) so a
+  // cadence break later on (mid-episode format switch, effects shot) still gets caught —
+  // ffmpeg streams frame-by-frame here, so more windows costs time, not memory.
+  const span = endTime !== null ? Math.max(0, endTime - startTime) : null;
+  const seeks = span !== null
+    ? buildSpreadOffsets(span, 8, 5, 8).map((rel) => Math.max(0, startTime + rel))
+    : [Math.max(0, startTime + 20), Math.max(0, startTime + 90)];
   const results = [];
   for (const seek of seeks) {
     results.push(await probeTelecineWindow(inputSource, seek, parity, 8));
@@ -1791,8 +1817,8 @@ function buildBwdifFilter(mode, parity) {
 
 function buildIvtcFilter(parity) {
   const order = parity === 'bff' ? 'bff' : parity === 'tff' ? 'tff' : 'auto';
-  const yParity = order === 'auto' ? 'auto' : order;
-  return `fieldmatch=order=${order}:combmatch=full,yadif=mode=send_frame:parity=${yParity}:deint=interlaced,decimate=cycle=5`;
+  const bParity = order === 'auto' ? 'auto' : order;
+  return `fieldmatch=order=${order}:combmatch=full,bwdif=mode=send_frame:parity=${bParity}:deint=interlaced,decimate=cycle=5`;
 }
 
 function makeFieldPlan(strategy, parity, fieldFilter, outFps, reason) {
@@ -1845,6 +1871,7 @@ function planFromForcedStrategy(forced, parity, sourceFps) {
  * }}
  */
 async function detectFieldStrategy(inputSource, videoStream, startTime, options = {}) {
+  const endTime = options.endTime !== undefined ? options.endTime : null;
   const fieldOrder = videoStream && videoStream.field_order;
   const rFps = videoStream && videoStream.r_frame_rate
     ? parseFrameRate(videoStream.r_frame_rate)
@@ -1889,7 +1916,7 @@ async function detectFieldStrategy(inputSource, videoStream, startTime, options 
     `Field strategy probe: field_order=${fieldOrder || 'missing'} r=${rFps || '?'} avg=${avgFps || '?'} softMeta=${softTelecineMeta}`,
   );
 
-  const stats = await sampleInterlaceWithIdet(inputSource, startTime, 10);
+  const stats = await sampleInterlaceWithIdet(inputSource, startTime, 10, endTime);
   if (stats) {
     const idetParity = parityFromIdet(stats);
     if (parity === 'auto' && idetParity !== 'auto') parity = idetParity;
@@ -1941,7 +1968,7 @@ async function detectFieldStrategy(inputSource, videoStream, startTime, options 
   if (ntsc30) {
     let isTc = false;
     try {
-      isTc = await probeTelecine(inputSource, startTime, parity);
+      isTc = await probeTelecine(inputSource, startTime, parity, endTime);
     } catch (e) {
       console.warn('Telecine probe failed:', e.message || e);
     }
@@ -2867,6 +2894,7 @@ async function main() {
       fieldPlan = await detectFieldStrategy(inputSource, videoStream, startTime, {
         forceStrategy,
         forceParity,
+        endTime: endTime !== null ? endTime : duration,
       });
     } catch (e) {
       console.warn('Field detection failed, keeping hybrid bwdif:', e.message || e);
