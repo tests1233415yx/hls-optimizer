@@ -309,7 +309,9 @@ function apiRequestRaw(urlStr, method = 'GET', headers = {}, body = null) {
         if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
           resolve({ status: res.statusCode, headers: res.headers, body: buffer });
         } else {
-          reject(new Error(`Request to ${urlStr} failed with status ${res.statusCode}: ${buffer.toString('utf8')}`));
+          const err = new Error(`Request to ${urlStr} failed with status ${res.statusCode}: ${buffer.toString('utf8')}`);
+          err.headers = res.headers;
+          reject(err);
         }
       });
     });
@@ -317,6 +319,25 @@ function apiRequestRaw(urlStr, method = 'GET', headers = {}, body = null) {
     if (body) req.write(body);
     req.end();
   });
+}
+
+// GitHub's primary rate limit resets on a fixed hourly window (X-RateLimit-Reset, epoch
+// seconds). Once a shared token is exhausted (e.g. several self-hosted runner agents on the
+// same VPS all pulling video byte-ranges through the authenticated api.github.com asset
+// endpoint), short fixed retry delays just re-hit the still-exhausted limit and burn through
+// the attempt budget in seconds instead of actually recovering. When the response tells us
+// remaining=0, wait until the window resets (capped so a single retry loop can't stall a job
+// forever) instead of the normal linear backoff.
+function computeBackoffMs(headers, fallbackMs) {
+  const remaining = headers && headers['x-ratelimit-remaining'];
+  const reset = headers && headers['x-ratelimit-reset'];
+  if (remaining === '0' && reset) {
+    const waitMs = (parseInt(reset, 10) * 1000) - Date.now() + 1000 + Math.random() * 2000;
+    if (waitMs > fallbackMs) {
+      return Math.min(waitMs, 90000);
+    }
+  }
+  return fallbackMs;
 }
 
 async function apiRequest(urlStr, method = 'GET', headers = {}, body = null, maxAttempts = 5) {
@@ -346,7 +367,7 @@ async function apiRequest(urlStr, method = 'GET', headers = {}, body = null, max
         throw err;
       }
 
-      const backoffMs = attempt * 1000 + Math.random() * 500;
+      const backoffMs = computeBackoffMs(err.headers, attempt * 1000 + Math.random() * 500);
       console.warn(`API request to ${urlStr} failed on attempt ${attempt}: ${err.message}. Retrying in ${Math.round(backoffMs)}ms...`);
       await new Promise(resolve => setTimeout(resolve, backoffMs));
     }
@@ -428,7 +449,9 @@ function downloadAsset(urlStr, token, destPath, maxRetries = 3) {
           }
           if (res.statusCode !== 200) {
             res.resume();
-            cleanupAndReject(new Error(`Failed to download asset, HTTP status: ${res.statusCode}`));
+            const err = new Error(`Failed to download asset, HTTP status: ${res.statusCode}`);
+            err.headers = res.headers;
+            cleanupAndReject(err);
             return;
           }
 
@@ -482,7 +505,7 @@ function downloadAsset(urlStr, token, destPath, maxRetries = 3) {
           }
           console.warn(`[DownloadAsset] Attempt ${attempt} failed: ${err.message}`);
           if (attempt < maxRetries) {
-            const delay = attempt * 2000;
+            const delay = computeBackoffMs(err.headers, attempt * 2000);
             console.log(`[DownloadAsset] Retrying in ${delay}ms...`);
             setTimeout(execute, delay);
           } else {
@@ -553,7 +576,9 @@ async function uploadAssetFile(uploadUrl, assetName, filePath, contentType, toke
             if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
               resolve(JSON.parse(buffer.toString('utf8')));
             } else {
-              reject(new Error(`Status ${res.statusCode}: ${buffer.toString('utf8')}`));
+              const err = new Error(`Status ${res.statusCode}: ${buffer.toString('utf8')}`);
+              err.headers = res.headers;
+              reject(err);
             }
           });
         });
@@ -623,7 +648,7 @@ async function uploadAssetFile(uploadUrl, assetName, filePath, contentType, toke
         }
       }
 
-      const backoffMs = attempt * 2000;
+      const backoffMs = computeBackoffMs(err.headers, attempt * 2000);
       console.log(`Retrying in ${backoffMs}ms...`);
       await new Promise(r => setTimeout(r, backoffMs));
     }
@@ -940,7 +965,9 @@ function attemptRangeDownload(url, destPath, token, start, end) {
 
       if (res.statusCode !== 206 && res.statusCode !== 200) {
         res.resume();
-        cleanupAndReject(new Error(`Failed range download: status ${res.statusCode}`));
+        const err = new Error(`Failed range download: status ${res.statusCode}`);
+        err.headers = res.headers;
+        cleanupAndReject(err);
         return;
       }
 
@@ -1065,7 +1092,7 @@ function downloadSingleRange(url, destPath, token, start, end, maxRetries) {
           }
           console.warn(`[Range Download] Attempt ${attempt} failed (bytes ${start}-${end}): ${err.message}`);
           if (attempt < maxRetries) {
-            const delay = attempt * 2000;
+            const delay = computeBackoffMs(err.headers, attempt * 2000);
             console.log(`[Range Download] Retrying in ${delay}ms...`);
             setTimeout(execute, delay);
           } else {
