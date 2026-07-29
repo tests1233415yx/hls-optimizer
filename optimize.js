@@ -1777,36 +1777,135 @@ function runFfmpegStderr(args) {
   });
 }
 
-// Output-side -ss after -i: input -ss on the range proxy produced empty idet windows.
-function buildFieldAnalysisArgs(inputSource, seekSeconds, sampleSeconds, vf) {
+/** Bound concurrent async work while preserving result order (full-span probes). */
+async function mapPool(items, concurrency, mapper) {
+  const list = Array.isArray(items) ? items : [];
+  const limit = Math.max(1, Math.min(concurrency || 1, list.length || 1));
+  const results = new Array(list.length);
+  let next = 0;
+  async function worker() {
+    while (true) {
+      const i = next++;
+      if (i >= list.length) return;
+      results[i] = await mapper(list[i], i);
+    }
+  }
+  await Promise.all(Array.from({ length: limit }, () => worker()));
+  return results;
+}
+
+// Hard 3:2 pulldown typically lands ~0.8; band absorbs short-window noise.
+function isTelecineRatio(ratio) {
+  return typeof ratio === 'number' && isFinite(ratio) && ratio >= 0.72 && ratio <= 0.88;
+}
+
+function isUsableIdetStats(stats) {
+  if (!stats) return false;
+  return idetStatsDetermined(stats) + (stats.undetermined || 0) > 0;
+}
+
+function isUsableTelecineFrameCounts(rawFrames, ivtcFrames) {
+  return !!(rawFrames && ivtcFrames && rawFrames >= 40);
+}
+
+/**
+ * Majority of conclusive telecine windows (ratio != null).
+ * Single conclusive window: that window decides. Empty → false.
+ */
+function telecineMajorityDecision(results) {
+  const list = Array.isArray(results) ? results : [];
+  const conclusive = list.filter((r) => r && r.ratio !== null && r.ratio !== undefined);
+  if (conclusive.length === 0) return false;
+  const yes = conclusive.filter((r) => r.ok).length;
+  if (conclusive.length === 1) return yes === 1;
+  return yes >= Math.ceil(conclusive.length / 2);
+}
+
+function mergeIdetWindowStats(statsList) {
+  const merged = { tff: 0, bff: 0, progressive: 0, undetermined: 0 };
+  let windows = 0;
+  let progHits = 0;
+  let interHits = 0;
+  let teleHits = 0;
+  for (const stats of statsList || []) {
+    if (!isUsableIdetStats(stats)) continue;
+    windows += 1;
+    merged.tff += stats.tff;
+    merged.bff += stats.bff;
+    merged.progressive += stats.progressive;
+    merged.undetermined += stats.undetermined;
+    if (isConfidentlyInterlacedFromIdet(stats)) interHits += 1;
+    else if (isTelecineLikeIdet(stats)) teleHits += 1;
+    else if (isConfidentlyProgressiveFromIdet(stats)) progHits += 1;
+  }
+  return { merged, windows, progHits, interHits, teleHits, any: windows > 0 };
+}
+
+/**
+ * Build ffmpeg args for a short field-analysis sample.
+ * seekPlacement:
+ *   - 'input'  → -ss before -i (fast container seek; can be empty on some range proxies)
+ *   - 'output' → -ss after -i  (accurate; historically reliable with the local cache proxy)
+ */
+function buildFieldAnalysisArgs(inputSource, seekSeconds, sampleSeconds, vf, seekPlacement = 'output') {
   const args = [
     '-nostdin', '-hide_banner',
     '-analyzeduration', '100M', '-probesize', '100M',
     '-protocol_whitelist', 'file,http,tcp,https,tls',
-    '-i', inputSource,
   ];
-  if (seekSeconds > 0) args.push('-ss', seekSeconds.toFixed(3));
+  const seek = seekSeconds > 0 ? seekSeconds : 0;
+  if (seekPlacement === 'input' && seek > 0) {
+    args.push('-ss', seek.toFixed(3));
+  }
+  args.push('-i', inputSource);
+  if (seekPlacement !== 'input' && seek > 0) {
+    args.push('-ss', seek.toFixed(3));
+  }
   args.push('-t', String(sampleSeconds), '-an', '-sn', '-dn', '-map', '0:v:0');
   if (vf) args.push('-vf', vf);
   args.push('-f', 'null', '-');
   return args;
 }
 
-async function runIdetSample(inputSource, seekSeconds, sampleSeconds) {
+/** Index of -ss relative to -i in analysis args (-1 if none). Pure helper for selftests. */
+function fieldAnalysisSeekMode(args) {
+  const list = Array.isArray(args) ? args : [];
+  const iIdx = list.indexOf('-i');
+  const ssIdx = list.indexOf('-ss');
+  if (ssIdx < 0 || iIdx < 0) return 'none';
+  return ssIdx < iIdx ? 'input' : 'output';
+}
+
+async function runIdetSampleOnce(inputSource, seekSeconds, sampleSeconds, seekPlacement) {
   const { code, stderr } = await runFfmpegStderr(
-    buildFieldAnalysisArgs(inputSource, seekSeconds, sampleSeconds, 'idet'),
+    buildFieldAnalysisArgs(inputSource, seekSeconds, sampleSeconds, 'idet', seekPlacement),
   );
   const stats = parseIdetStats(stderr);
   if (stats) {
     console.log(
-      `idet @${seekSeconds.toFixed(1)}s: TFF=${stats.tff} BFF=${stats.bff} Progressive=${stats.progressive} Undetermined=${stats.undetermined} (exit=${code})`,
+      `idet @${seekSeconds.toFixed(1)}s [${seekPlacement}]: TFF=${stats.tff} BFF=${stats.bff} Progressive=${stats.progressive} Undetermined=${stats.undetermined} (exit=${code})`,
     );
   } else {
-    console.warn(`idet @${seekSeconds.toFixed(1)}s: no stats (exit=${code})`);
+    console.warn(`idet @${seekSeconds.toFixed(1)}s [${seekPlacement}]: no stats (exit=${code})`);
     const tail = stderr.trim().split(/\r?\n/).slice(-6).join('\n');
     if (tail) console.warn(`idet stderr tail:\n${tail}`);
   }
   return stats;
+}
+
+/**
+ * Prefer fast input -ss for mid/late windows; if the sample is empty/unusable
+ * (known range-proxy footgun), fall back to accurate post-input -ss for that window.
+ */
+async function runIdetSample(inputSource, seekSeconds, sampleSeconds) {
+  if (seekSeconds > 0) {
+    const fast = await runIdetSampleOnce(inputSource, seekSeconds, sampleSeconds, 'input');
+    if (isUsableIdetStats(fast)) return fast;
+    console.warn(
+      `idet @${seekSeconds.toFixed(1)}s: input -ss unusable, falling back to output -ss`,
+    );
+  }
+  return runIdetSampleOnce(inputSource, seekSeconds, sampleSeconds, 'output');
 }
 
 // Spread N sample windows across [0, span] (relative to startTime), always including 0
@@ -1825,104 +1924,117 @@ function buildSpreadOffsets(span, sampleSeconds, minWindows, maxWindows) {
   return [...new Set(offsets)].sort((a, b) => a - b);
 }
 
+// How many independent field windows to run at once (CPU/network bound on GHA).
+const FIELD_PROBE_CONCURRENCY = 3;
+
 async function sampleInterlaceWithIdet(inputSource, startTime, sampleSeconds = 10, endTime = null) {
-  // Dense windows spread across the full episode/chunk instead of only the first few
-  // minutes — cadence/combing can change well past 240s.
+  // Full-span: visit EVERY planned offset (no early-exit). Cadence/combing can change
+  // past the open; user preference is whole-part coverage over abort-on-majority.
+  // Speed comes from input -ss + bounded concurrency, not from skipping windows.
   const span = endTime !== null ? Math.max(0, endTime - startTime) : null;
   const offsets = span !== null
     ? buildSpreadOffsets(span, sampleSeconds, 5, 12)
     : [0, 12, 45, 120, 240];
-  let merged = { tff: 0, bff: 0, progressive: 0, undetermined: 0 };
-  let any = false;
-  let progHits = 0;
-  let interHits = 0;
-  let teleHits = 0;
-  let windows = 0;
 
-  for (const rel of offsets) {
+  console.log(
+    `idet full-span: ${offsets.length} windows (concurrency=${FIELD_PROBE_CONCURRENCY}) offsets=[${offsets.join(',')}]`,
+  );
+
+  const perWindow = await mapPool(offsets, FIELD_PROBE_CONCURRENCY, async (rel) => {
     const seek = Math.max(0, startTime + rel);
     const stats = await runIdetSample(inputSource, seek, sampleSeconds);
-    if (!stats || idetStatsDetermined(stats) + (stats.undetermined || 0) === 0) continue;
-    any = true;
-    windows += 1;
-    merged.tff += stats.tff;
-    merged.bff += stats.bff;
-    merged.progressive += stats.progressive;
-    merged.undetermined += stats.undetermined;
+    return { rel, seek, stats };
+  });
 
-    if (isConfidentlyInterlacedFromIdet(stats)) interHits += 1;
-    else if (isTelecineLikeIdet(stats)) teleHits += 1;
-    else if (isConfidentlyProgressiveFromIdet(stats)) progHits += 1;
-
-    // Interlaced / telecine-like: 2 windows enough.
-    // Progressive alone: need 3 windows — One Piece-style opens are clean progressive
-    // while the body still has woven combing idet mislabels as progressive.
-    if (interHits >= 2 || teleHits >= 2) {
-      console.log(
-        `idet stop @+${rel}s inter=${interHits} tele=${teleHits} prog=${progHits} → TFF=${merged.tff} BFF=${merged.bff} Progressive=${merged.progressive} Undetermined=${merged.undetermined}`,
-      );
-      return merged;
-    }
-    if (progHits >= 3 && windows >= 3 && interHits === 0 && teleHits === 0) {
-      console.log(
-        `idet stop @+${rel}s progressive x${progHits} → TFF=${merged.tff} BFF=${merged.bff} Progressive=${merged.progressive} Undetermined=${merged.undetermined}`,
-      );
-      return merged;
-    }
-  }
+  const { merged, windows, progHits, interHits, teleHits, any } = mergeIdetWindowStats(
+    perWindow.map((w) => w.stats),
+  );
 
   if (!any) return null;
   console.log(
-    `idet aggregated (windows=${windows}): TFF=${merged.tff} BFF=${merged.bff} Progressive=${merged.progressive} Undetermined=${merged.undetermined}`,
+    `idet aggregated (windows=${windows}/${offsets.length} inter=${interHits} tele=${teleHits} prog=${progHits}): TFF=${merged.tff} BFF=${merged.bff} Progressive=${merged.progressive} Undetermined=${merged.undetermined}`,
   );
   return merged;
 }
 
+async function probeTelecineWindowOnce(inputSource, seek, parity, sampleSeconds, seekPlacement) {
+  const order = parity === 'bff' ? 'bff' : parity === 'tff' ? 'tff' : 'auto';
+  const ivtcVf = `fieldmatch=order=${order}:combmatch=full,decimate=cycle=5`;
+  // raw + IVTC are independent — run in parallel for the same seek.
+  const [raw, ivtc] = await Promise.all([
+    runFfmpegStderr(
+      buildFieldAnalysisArgs(inputSource, seek, sampleSeconds, null, seekPlacement),
+    ),
+    runFfmpegStderr(
+      buildFieldAnalysisArgs(inputSource, seek, sampleSeconds, ivtcVf, seekPlacement),
+    ),
+  ]);
+  const rawFrames = parseLastFrameCount(raw.stderr);
+  const ivtcFrames = parseLastFrameCount(ivtc.stderr);
+  return { rawFrames, ivtcFrames, seekPlacement };
+}
+
 /**
  * Confirm hard 3:2 pulldown: IVTC frame count ≈ 0.8 × source over the same wall time.
- * Two windows must agree when both are conclusive (reduces logo/credits false positives).
+ * Fast input -ss first; fall back to accurate output -ss if frame counts are unusable.
  */
 async function probeTelecineWindow(inputSource, seek, parity, sampleSeconds = 8) {
-  const order = parity === 'bff' ? 'bff' : parity === 'tff' ? 'tff' : 'auto';
-  const raw = await runFfmpegStderr(
-    buildFieldAnalysisArgs(inputSource, seek, sampleSeconds, null),
-  );
-  const rawFrames = parseLastFrameCount(raw.stderr);
-  const ivtc = await runFfmpegStderr(
-    buildFieldAnalysisArgs(
-      inputSource,
-      seek,
-      sampleSeconds,
-      `fieldmatch=order=${order}:combmatch=full,decimate=cycle=5`,
-    ),
-  );
-  const ivtcFrames = parseLastFrameCount(ivtc.stderr);
-  if (!rawFrames || !ivtcFrames || rawFrames < 40) {
-    return { ok: false, ratio: null, rawFrames, ivtcFrames };
+  let rawFrames = null;
+  let ivtcFrames = null;
+  let usedPlacement = 'output';
+
+  if (seek > 0) {
+    const fast = await probeTelecineWindowOnce(inputSource, seek, parity, sampleSeconds, 'input');
+    if (isUsableTelecineFrameCounts(fast.rawFrames, fast.ivtcFrames)) {
+      rawFrames = fast.rawFrames;
+      ivtcFrames = fast.ivtcFrames;
+      usedPlacement = 'input';
+    } else {
+      console.warn(
+        `Telecine @${seek.toFixed(1)}s: input -ss unusable (raw=${fast.rawFrames} ivtc=${fast.ivtcFrames}), falling back to output -ss`,
+      );
+    }
+  }
+
+  if (!isUsableTelecineFrameCounts(rawFrames, ivtcFrames)) {
+    const accurate = await probeTelecineWindowOnce(inputSource, seek, parity, sampleSeconds, 'output');
+    rawFrames = accurate.rawFrames;
+    ivtcFrames = accurate.ivtcFrames;
+    usedPlacement = 'output';
+  }
+
+  if (!isUsableTelecineFrameCounts(rawFrames, ivtcFrames)) {
+    console.log(
+      `Telecine probe @${seek.toFixed(1)}s [${usedPlacement}]: raw=${rawFrames} ivtc=${ivtcFrames} → inconclusive`,
+    );
+    return { ok: false, ratio: null, rawFrames, ivtcFrames, seekPlacement: usedPlacement };
   }
   const ratio = ivtcFrames / rawFrames;
-  const isTc = ratio >= 0.72 && ratio <= 0.88;
+  const isTc = isTelecineRatio(ratio);
   console.log(
-    `Telecine probe @${seek.toFixed(1)}s: raw=${rawFrames} ivtc=${ivtcFrames} ratio=${ratio.toFixed(3)} → ${isTc ? 'TELECINE' : 'no'}`,
+    `Telecine probe @${seek.toFixed(1)}s [${usedPlacement}]: raw=${rawFrames} ivtc=${ivtcFrames} ratio=${ratio.toFixed(3)} → ${isTc ? 'TELECINE' : 'no'}`,
   );
-  return { ok: isTc, ratio, rawFrames, ivtcFrames };
+  return { ok: isTc, ratio, rawFrames, ivtcFrames, seekPlacement: usedPlacement };
 }
 
 async function probeTelecine(inputSource, startTime, parity, endTime = null) {
-  // Spread telecine-ratio checks across the whole episode/chunk (not just +20s/+90s) so a
-  // cadence break later on (mid-episode format switch, effects shot) still gets caught —
-  // ffmpeg streams frame-by-frame here, so more windows costs time, not memory.
+  // Full-span: every planned offset is probed (no early-exit). Speed: concurrent
+  // windows + input -ss + parallel raw/IVTC pair per window.
   const span = endTime !== null ? Math.max(0, endTime - startTime) : null;
   const seeks = span !== null
     ? buildSpreadOffsets(span, 8, 5, 8).map((rel) => Math.max(0, startTime + rel))
     : [Math.max(0, startTime + 20), Math.max(0, startTime + 90)];
-  const results = [];
-  for (const seek of seeks) {
+
+  console.log(
+    `telecine full-span: ${seeks.length} windows (concurrency=${FIELD_PROBE_CONCURRENCY}) seeks=[${seeks.map((s) => s.toFixed(0)).join(',')}]`,
+  );
+
+  const results = await mapPool(seeks, FIELD_PROBE_CONCURRENCY, async (seek) => {
     const result = await probeTelecineWindow(inputSource, seek, parity, 8);
-    results.push({ ...result, seek });
-  }
+    return { ...result, seek };
+  });
+
   const conclusive = results.filter((r) => r.ratio !== null);
-  if (conclusive.length === 0) return false;
   const yes = conclusive.filter((r) => r.ok).length;
   const no = conclusive.length - yes;
 
@@ -1943,9 +2055,7 @@ async function probeTelecine(inputSource, startTime, parity, endTime = null) {
     }
   }
 
-  // One strong yes is enough if only one window worked; two windows need majority.
-  if (conclusive.length === 1) return yes === 1;
-  return yes >= Math.ceil(conclusive.length / 2);
+  return telecineMajorityDecision(results);
 }
 
 function buildBwdifFilter(mode, parity) {
@@ -4114,5 +4224,14 @@ if (require.main === module) {
     storyboardSheetName,
     buildStoryboardVttBody,
     storyboardSpriteGlob,
+    buildFieldAnalysisArgs,
+    fieldAnalysisSeekMode,
+    isTelecineRatio,
+    isUsableIdetStats,
+    isUsableTelecineFrameCounts,
+    telecineMajorityDecision,
+    mergeIdetWindowStats,
+    mapPool,
+    FIELD_PROBE_CONCURRENCY,
   };
 }

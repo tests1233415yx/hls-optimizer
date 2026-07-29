@@ -24,6 +24,15 @@ const {
   storyboardSheetName,
   buildStoryboardVttBody,
   storyboardSpriteGlob,
+  buildFieldAnalysisArgs,
+  fieldAnalysisSeekMode,
+  isTelecineRatio,
+  isUsableIdetStats,
+  isUsableTelecineFrameCounts,
+  telecineMajorityDecision,
+  mergeIdetWindowStats,
+  mapPool,
+  FIELD_PROBE_CONCURRENCY,
 } = require('./optimize.js');
 
 let passed = 0;
@@ -327,6 +336,112 @@ run('buildStoryboardVttBody: cues use 5s steps and .avif #xywh URLs', () => {
   assertTrue(body.includes('thumbnails/thumb_sprite_001.avif#xywh=320,0,320,180'), 'second col');
   assertFalse(body.includes('.jpg'), 'no jpeg references');
   assertEqual(countStoryboardThumbs(12, 5), 3, 'three thumbs for 12s');
+});
+
+// ---------------------------------------------------------------------------
+// Field / telecine full-span speed helpers (no early-exit; fast seek placement)
+// ---------------------------------------------------------------------------
+
+run('buildFieldAnalysisArgs: input vs output -ss placement', () => {
+  const outArgs = buildFieldAnalysisArgs('http://x/v.mp4', 270, 10, 'idet', 'output');
+  assertEqual(fieldAnalysisSeekMode(outArgs), 'output', 'output seek after -i');
+  const inArgs = buildFieldAnalysisArgs('http://x/v.mp4', 270, 10, 'idet', 'input');
+  assertEqual(fieldAnalysisSeekMode(inArgs), 'input', 'input seek before -i');
+  const zero = buildFieldAnalysisArgs('http://x/v.mp4', 0, 10, 'idet', 'input');
+  assertEqual(fieldAnalysisSeekMode(zero), 'none', 'no -ss when seek=0');
+  assertTrue(inArgs.includes('idet'), 'vf present');
+  assertTrue(FIELD_PROBE_CONCURRENCY >= 2, 'concurrency allows parallel windows');
+});
+
+run('isTelecineRatio band and frame-count usability', () => {
+  assertTrue(isTelecineRatio(0.8), '0.8 is classic 3:2');
+  assertTrue(isTelecineRatio(0.72), 'lower band edge');
+  assertTrue(isTelecineRatio(0.88), 'upper band edge');
+  assertFalse(isTelecineRatio(0.71), 'below band');
+  assertFalse(isTelecineRatio(0.9), 'above band');
+  assertFalse(isTelecineRatio(null), 'null');
+  assertTrue(isUsableTelecineFrameCounts(100, 80), 'usable pair');
+  assertFalse(isUsableTelecineFrameCounts(30, 24), 'raw too small');
+  assertFalse(isUsableTelecineFrameCounts(100, 0), 'missing ivtc');
+});
+
+run('telecineMajorityDecision: full-span majority, single window, empty', () => {
+  assertFalse(telecineMajorityDecision([]), 'empty → false');
+  assertTrue(
+    telecineMajorityDecision([{ ok: true, ratio: 0.8 }]),
+    'single conclusive yes',
+  );
+  assertFalse(
+    telecineMajorityDecision([{ ok: false, ratio: 0.95 }]),
+    'single conclusive no',
+  );
+  assertTrue(
+    telecineMajorityDecision([
+      { ok: true, ratio: 0.8 },
+      { ok: true, ratio: 0.79 },
+      { ok: false, ratio: 0.99 },
+    ]),
+    '2 of 3 yes → majority',
+  );
+  assertFalse(
+    telecineMajorityDecision([
+      { ok: true, ratio: 0.8 },
+      { ok: false, ratio: 0.99 },
+      { ok: false, ratio: 1.0 },
+    ]),
+    '1 of 3 yes → no majority',
+  );
+  // Inconclusive (ratio null) windows do not vote.
+  assertTrue(
+    telecineMajorityDecision([
+      { ok: true, ratio: 0.8 },
+      { ok: false, ratio: null },
+      { ok: true, ratio: 0.81 },
+    ]),
+    'null ratios ignored; 2/2 yes',
+  );
+});
+
+run('mergeIdetWindowStats aggregates all windows (full-span, no early abort)', () => {
+  const inter = { tff: 100, bff: 0, progressive: 10, undetermined: 0 };
+  const prog = { tff: 5, bff: 3, progressive: 200, undetermined: 2 };
+  const agg = mergeIdetWindowStats([inter, prog, null, inter]);
+  assertEqual(agg.windows, 3, 'three usable windows');
+  assertEqual(agg.interHits, 2, 'two interlaced hits counted');
+  assertEqual(agg.progHits, 1, 'one progressive hit');
+  assertEqual(agg.merged.tff, 205, 'tff summed across full span');
+  assertTrue(agg.any, 'any true');
+  assertFalse(mergeIdetWindowStats([]).any, 'empty list');
+});
+
+run('isUsableIdetStats', () => {
+  assertFalse(isUsableIdetStats(null), 'null');
+  assertFalse(isUsableIdetStats({ tff: 0, bff: 0, progressive: 0, undetermined: 0 }), 'all zero');
+  assertTrue(isUsableIdetStats({ tff: 1, bff: 0, progressive: 0, undetermined: 0 }), 'has tff');
+  assertTrue(isUsableIdetStats({ tff: 0, bff: 0, progressive: 0, undetermined: 5 }), 'undet only');
+});
+
+run('mapPool preserves order under concurrency=2 (subprocess, real shipped fn)', () => {
+  // Selftest harness is sync; drive the real async mapPool in a short-lived Node child.
+  const { spawnSync } = require('child_process');
+  const script = `
+    const { mapPool } = require(${JSON.stringify(require('path').join(__dirname, 'optimize.js'))});
+    mapPool([10, 20, 30, 40], 2, async (n, i) => {
+      await new Promise((r) => setTimeout(r, 20 - i * 4));
+      return n * 2;
+    }).then((out) => {
+      if (JSON.stringify(out) !== JSON.stringify([20, 40, 60, 80])) {
+        console.error('bad order', out);
+        process.exit(2);
+      }
+      process.exit(0);
+    }).catch((e) => { console.error(e); process.exit(3); });
+  `;
+  const r = spawnSync(process.execPath, ['-e', script], {
+    encoding: 'utf8',
+    timeout: 10000,
+  });
+  assertEqual(r.status, 0, `mapPool child exit 0 (stderr=${r.stderr || ''})`);
 });
 
 // ---------------------------------------------------------------------------
