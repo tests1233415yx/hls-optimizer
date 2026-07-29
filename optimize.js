@@ -98,13 +98,22 @@ function getAV1ParamsForLabel(label) {
   return { preset, crf };
 }
 
+// Cache holds the in-flight/resolved Promise (not the boolean) so concurrent callers
+// awaiting the same check share one ffmpeg spawn instead of racing duplicate ones.
+let _svtAv1SupportPromise = null;
 function checkSvtAv1() {
-  try {
-    execSync('ffmpeg -encoders | grep -i svtav1', { stdio: 'ignore' });
-    return true;
-  } catch (e) {
-    return false;
+  if (!_svtAv1SupportPromise) {
+    _svtAv1SupportPromise = (async () => {
+      try {
+        const out = await execAsync('ffmpeg -encoders 2>&1');
+        return /svtav1/i.test(out);
+      } catch (e) {
+        const combined = `${e.stdout || ''}${e.stderr || ''}`;
+        return /svtav1/i.test(combined);
+      }
+    })();
   }
+  return _svtAv1SupportPromise;
 }
 
 // Source bit depth from ffprobe: pix_fmt name is authoritative (yuv420p10le etc.),
@@ -122,31 +131,99 @@ function getSourceBitDepth(videoStream) {
   return 8;
 }
 
-let _x264TenBitSupport = null;
+let _x264TenBitSupportPromise = null;
 // Most distro/official ffmpeg builds link libx264 compiled 8-bit-only (High profile caps
 // at yuv420p). 10-bit needs a High10-capable libx264, which not every build ships — check
 // the actual encoder's supported pixel formats rather than assuming.
 function checkX264TenBitSupport() {
-  if (_x264TenBitSupport !== null) return _x264TenBitSupport;
-  try {
-    const out = execSync('ffmpeg -h encoder=libx264 2>&1', { encoding: 'utf8' });
-    _x264TenBitSupport = /yuv420p10le/i.test(out);
-  } catch (e) {
-    _x264TenBitSupport = false;
+  if (!_x264TenBitSupportPromise) {
+    _x264TenBitSupportPromise = (async () => {
+      try {
+        const out = await execAsync('ffmpeg -h encoder=libx264 2>&1');
+        return /yuv420p10le/i.test(out);
+      } catch (e) {
+        const combined = `${e.stdout || ''}${e.stderr || ''}`;
+        return /yuv420p10le/i.test(combined);
+      }
+    })();
   }
-  return _x264TenBitSupport;
+  return _x264TenBitSupportPromise;
 }
 
-let _av1TenBitSupport = null;
+let _av1TenBitSupportPromise = null;
 function checkAv1TenBitSupport() {
-  if (_av1TenBitSupport !== null) return _av1TenBitSupport;
-  try {
-    const out = execSync('ffmpeg -h encoder=libsvtav1 2>&1', { encoding: 'utf8' });
-    _av1TenBitSupport = /yuv420p10le/i.test(out);
-  } catch (e) {
-    _av1TenBitSupport = false;
+  if (!_av1TenBitSupportPromise) {
+    _av1TenBitSupportPromise = (async () => {
+      try {
+        const out = await execAsync('ffmpeg -h encoder=libsvtav1 2>&1');
+        return /yuv420p10le/i.test(out);
+      } catch (e) {
+        const combined = `${e.stdout || ''}${e.stderr || ''}`;
+        return /yuv420p10le/i.test(combined);
+      }
+    })();
   }
-  return _av1TenBitSupport;
+  return _av1TenBitSupportPromise;
+}
+
+// Known SDR transfer characteristics (ffprobe color_transfer names) — anything else
+// paired with bt2020 primaries is treated as HDR-ish to be safe.
+const SDR_TRANSFERS = new Set([
+  'bt709', 'bt470m', 'bt470bg', 'smpte170m', 'smpte240m', 'linear', 'gamma22', 'gamma28',
+  'iec61966-2-1', 'iec61966-2-4', 'bt1361e', 'log100', 'log316', 'unknown', '',
+  'bt2020-10', 'bt2020-12',
+]);
+
+// HDR detection: PQ (smpte2084) and HLG (arib-std-b67) are the two HDR transfer functions
+// ffmpeg/ffprobe report. Also treat bt2020 primaries with a non-SDR transfer as HDR since
+// some sources omit/misreport the transfer tag but still carry wide-gamut HDR data.
+// Defaults to false (SDR) whenever fields are missing/unrecognized — never throws.
+function isHdrSource(videoStream) {
+  if (!videoStream || typeof videoStream !== 'object') return false;
+  try {
+    const transfer = String(videoStream.color_transfer || '').toLowerCase();
+    const primaries = String(videoStream.color_primaries || '').toLowerCase();
+    if (transfer === 'smpte2084' || transfer === 'arib-std-b67') return true;
+    if (primaries === 'bt2020' && transfer !== '' && !SDR_TRANSFERS.has(transfer)) return true;
+    return false;
+  } catch (e) {
+    return false;
+  }
+}
+
+// HDR (PQ/HLG, bt2020) -> SDR (bt709) tonemap filter chain using zscale/tonemap (libzimg).
+// linear-light tonemap (hable, mild desat) then convert primaries/matrix/transfer to bt709.
+// Requires ffmpeg built with --enable-libzscale (and zimg); not all builds have it, hence
+// checkZscaleSupport() below gates whether this is ever applied.
+// wantsHighBitDepth: keep the post-tonemap pixel format at 10-bit for high-bit-depth
+// sources so the subsequent -pix_fmt yuv420p10le encode path isn't fed data that was
+// already truncated to 8-bit here (that would silently discard the whole point of a
+// 10-bit encode). Falls back to 8-bit yuv420p otherwise.
+function buildTonemapFilter(wantsHighBitDepth) {
+  const outFmt = wantsHighBitDepth ? 'yuv420p10le' : 'yuv420p';
+  return `zscale=transfer=linear:npl=100,format=gbrpf32le,tonemap=tonemap=hable:desat=0,zscale=transfer=bt709:matrix=bt709:primaries=bt709,format=${outFmt}`;
+}
+
+let _zscaleSupportPromise = null;
+// Same capability-check pattern as checkX264TenBitSupport/checkAv1TenBitSupport: probe the
+// actual ffmpeg build rather than assuming, since zscale/tonemap need libzimg compiled in.
+// NOTE: `ffmpeg -h filter=zscale` always echoes the queried name back (e.g. "Unknown filter
+// 'zscale'.") even when the filter doesn't exist, so testing the output for the substring
+// "zscale" is a no-op that always resolves true. List the actually-registered filters instead
+// and match zscale as a distinct token.
+function checkZscaleSupport() {
+  if (!_zscaleSupportPromise) {
+    _zscaleSupportPromise = (async () => {
+      try {
+        const out = await execAsync('ffmpeg -filters 2>&1');
+        return /(^|\s)zscale(\s|$)/im.test(out);
+      } catch (e) {
+        const combined = `${e.stdout || ''}${e.stderr || ''}`;
+        return /(^|\s)zscale(\s|$)/im.test(combined);
+      }
+    })();
+  }
+  return _zscaleSupportPromise;
 }
 
 function adjustVideoParams(label, codec, origBitrateKbps, origHeight, duration, basePreset, baseCrf) {
@@ -1841,11 +1918,31 @@ async function probeTelecine(inputSource, startTime, parity, endTime = null) {
     : [Math.max(0, startTime + 20), Math.max(0, startTime + 90)];
   const results = [];
   for (const seek of seeks) {
-    results.push(await probeTelecineWindow(inputSource, seek, parity, 8));
+    const result = await probeTelecineWindow(inputSource, seek, parity, 8);
+    results.push({ ...result, seek });
   }
   const conclusive = results.filter((r) => r.ratio !== null);
   if (conclusive.length === 0) return false;
   const yes = conclusive.filter((r) => r.ok).length;
+  const no = conclusive.length - yes;
+
+  // Detect a possible mid-episode cadence break: if both yes and no windows show up in
+  // meaningful numbers, a single fieldFilter for the whole file may not be correct
+  // everywhere. This is purely diagnostic — the majority-vote return value below is
+  // unchanged, and no per-segment strategy switching is attempted here.
+  if (conclusive.length >= 4 && yes > 0 && no > 0) {
+    const yesFrac = yes / conclusive.length;
+    const noFrac = no / conclusive.length;
+    if (yesFrac >= 0.2 && noFrac >= 0.2) {
+      const detail = conclusive
+        .map((r) => `@${r.seek !== undefined ? r.seek.toFixed(1) : '?'}s ratio=${r.ratio.toFixed(3)} → ${r.ok ? 'TELECINE' : 'no'}`)
+        .join(', ');
+      console.warn(
+        `possible mixed/inconsistent telecine cadence - episode may have combing artifacts in some sections; single-pass field strategy may not fully clean the whole file (yes=${yes} no=${no} of ${conclusive.length} conclusive windows): ${detail}`,
+      );
+    }
+  }
+
   // One strong yes is enough if only one window worked; two windows need majority.
   if (conclusive.length === 1) return yes === 1;
   return yes >= Math.ceil(conclusive.length / 2);
@@ -2085,13 +2182,17 @@ async function detectFieldStrategy(inputSource, videoStream, startTime, options 
   return plan;
 }
 
-/** field restore → optional CFR pin → scale. */
-function buildScaleVf(targetHeight, fieldPlan) {
+/** field restore → optional CFR pin → optional HDR→SDR tonemap → scale. */
+function buildScaleVf(targetHeight, fieldPlan, tonemapFilter) {
   const scale = `scale='trunc(oh*a/2)*2':'trunc(min(${targetHeight},ih)/2)*2'`;
-  if (!fieldPlan || typeof fieldPlan !== 'object') return scale;
+  if (!fieldPlan || typeof fieldPlan !== 'object') {
+    return tonemapFilter ? `${tonemapFilter},${scale}` : scale;
+  }
   const parts = [];
   if (fieldPlan.fieldFilter) parts.push(fieldPlan.fieldFilter);
   if (fieldPlan.outFps) parts.push(`fps=${fieldPlan.outFps}`);
+  // Tonemap runs on native (deinterlaced/IVTC'd) pixel data, before the final scale.
+  if (tonemapFilter) parts.push(tonemapFilter);
   parts.push(scale);
   return parts.join(',');
 }
@@ -2413,7 +2514,7 @@ async function main() {
 
   // 5. Probe video stream properties
   console.log('Probing video stream properties...');
-  const probeCmd = `ffprobe -v error -analyzeduration 100M -probesize 100M -show_entries "format=duration,size,bit_rate:stream=index,codec_type,codec_name,width,height,channels,r_frame_rate,avg_frame_rate,bit_rate,field_order,pix_fmt,bits_per_raw_sample,profile:stream_tags" -of json -protocol_whitelist file,http,tcp,https,tls "${inputSource}"`;
+  const probeCmd = `ffprobe -v error -analyzeduration 100M -probesize 100M -show_entries "format=duration,size,bit_rate:stream=index,codec_type,codec_name,width,height,channels,r_frame_rate,avg_frame_rate,bit_rate,field_order,pix_fmt,bits_per_raw_sample,profile,color_transfer,color_primaries,color_space:stream_tags" -of json -protocol_whitelist file,http,tcp,https,tls "${inputSource}"`;
   const probeData = JSON.parse(await execAsync(probeCmd, { maxBuffer: 100 * 1024 * 1024 }));
 
   const videoStream = probeData.streams.find(s => s.codec_type === 'video');
@@ -3005,7 +3106,7 @@ async function main() {
     console.log(`Running FFmpeg segmenting on video for codec: ${codec}...`);
     
     if (codec === 'av1') {
-      const svtav1Available = checkSvtAv1();
+      const svtav1Available = await checkSvtAv1();
       if (!svtav1Available) {
         console.log(`AV1 encoder (libsvtav1) not available in this ffmpeg build, skipping AV1 rendition`);
         throw new Error('libsvtav1 encoder not available');
@@ -3084,7 +3185,20 @@ async function main() {
       );
       console.log(`Dynamic params adjusted for ${codec}: CRF=${dynamicParams.crf}, Preset=${dynamicParams.preset}, Maxrate=${dynamicParams.maxrate || 'N/A'}, Bufsize=${dynamicParams.bufsize || 'N/A'}`);
 
-      const vfChain = buildScaleVf(tHeight, fieldPlan);
+      const sourceBitDepth = getSourceBitDepth(videoStream);
+      const wantsHighBitDepth = sourceBitDepth >= 10;
+
+      let tonemapFilter = null;
+      if (isHdrSource(videoStream)) {
+        if (await checkZscaleSupport()) {
+          tonemapFilter = buildTonemapFilter(wantsHighBitDepth);
+          console.log(`HDR source detected (color_transfer=${videoStream && videoStream.color_transfer}, color_primaries=${videoStream && videoStream.color_primaries}) → applying zscale/tonemap HDR→SDR chain`);
+        } else {
+          console.warn('HDR source detected but ffmpeg lacks zscale/tonemap support - output colors will be wrong, consider a different ffmpeg build');
+        }
+      }
+
+      const vfChain = buildScaleVf(tHeight, fieldPlan, tonemapFilter);
       console.log(`Video filter chain for ${codec} [${fieldPlan.strategy}]: ${vfChain}`);
 
       // Output CFR after field restore so HLS timestamps stay stable (IVTC/bob).
@@ -3104,13 +3218,10 @@ async function main() {
       }
       const outFpsNum = fieldPlanOutputFpsNumber(fieldPlan, sourceFpsNum);
 
-      const sourceBitDepth = getSourceBitDepth(videoStream);
-      const wantsHighBitDepth = sourceBitDepth >= 10;
-
       if (codec === 'h264') {
         let outputPixFmt = 'yuv420p';
         let outputProfile = hls_profile;
-        if (wantsHighBitDepth && checkX264TenBitSupport()) {
+        if (wantsHighBitDepth && await checkX264TenBitSupport()) {
           outputPixFmt = 'yuv420p10le';
           outputProfile = 'high10'; // High/Main profiles cap at 8-bit; 10-bit needs High10.
           console.log(`Source is ${sourceBitDepth}-bit, libx264 supports 10-bit → encoding yuv420p10le/high10`);
@@ -3140,7 +3251,7 @@ async function main() {
         const gop = Math.max(1, Math.round(outFpsNum * 6));
 
         let av1PixFmt = 'yuv420p';
-        if (wantsHighBitDepth && checkAv1TenBitSupport()) {
+        if (wantsHighBitDepth && await checkAv1TenBitSupport()) {
           av1PixFmt = 'yuv420p10le';
           console.log(`Source is ${sourceBitDepth}-bit, libsvtav1 supports 10-bit → encoding yuv420p10le`);
         } else if (wantsHighBitDepth) {
@@ -3584,16 +3695,34 @@ function cleanupWorkDirSync() {
   } catch (e) {}
 }
 
-process.on('SIGINT', () => { cleanupWorkDirSync(); process.exit(130); });
-process.on('SIGTERM', () => { cleanupWorkDirSync(); process.exit(143); });
-process.on('uncaughtException', (err) => {
-  console.error('Uncaught Exception:', err);
-  cleanupWorkDirSync();
-  process.exit(1);
-});
+if (require.main === module) {
+  process.on('SIGINT', () => { cleanupWorkDirSync(); process.exit(130); });
+  process.on('SIGTERM', () => { cleanupWorkDirSync(); process.exit(143); });
+  process.on('uncaughtException', (err) => {
+    console.error('Uncaught Exception:', err);
+    cleanupWorkDirSync();
+    process.exit(1);
+  });
 
-main().catch(err => {
-  console.error('Unhandled Fatal Error outside main try-catch:', err);
-  cleanupWorkDirSync();
-  process.exit(1);
-});
+  main().catch(err => {
+    console.error('Unhandled Fatal Error outside main try-catch:', err);
+    cleanupWorkDirSync();
+    process.exit(1);
+  });
+} else {
+  // Additive, guarded export block for self-test purposes only (selftest.js). Does not
+  // change standalone runtime behavior since it's only reached when required as a module.
+  module.exports = {
+    buildSpreadOffsets,
+    getSourceBitDepth,
+    parseIdetStats,
+    isConfidentlyInterlacedFromIdet,
+    isConfidentlyProgressiveFromIdet,
+    isTelecineLikeIdet,
+    parityFromIdet,
+    fpsToRateString,
+    isHdrSource,
+    normalizeFieldStrategy,
+    normalizeFieldParity,
+  };
+}
