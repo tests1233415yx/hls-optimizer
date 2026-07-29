@@ -2291,6 +2291,16 @@ function generateKeyframeTimeline(sceneCuts, duration, targetSec = 6, minSec = 3
   return forcedTimestamps;
 }
 
+/**
+ * Whether this runner should compute the shared scene-cut segment timeline.
+ * Audio is always a separate job from video, but both must recompute the same
+ * 3-9s grid so A/V boundaries line up. Original remux / subtitles / thumbnails
+ * do not use that grid.
+ */
+function shouldComputeSegmentTimeline(kind, { isSubtitlesJob = false, isThumbnailsJob = false } = {}) {
+  return kind !== 'original' && !isSubtitlesJob && !isThumbnailsJob;
+}
+
 async function main() {
   isGlobalAborted = false;
   let payloadStr = process.env.EVENT_PAYLOAD;
@@ -2993,8 +3003,12 @@ async function main() {
   // Computed here, ahead of audio segmenting below, so audio can be cut at the same
   // scene-aligned points as video instead of its own flat interval - see the aligned
   // branch in the audio ffmpeg command for why that matters.
+  //
+  // Audio is never in the same runner as video. Standalone audio jobs must recompute
+  // the same field plan + scene-cut grid as the video encode jobs so -segment_times
+  // matches -force_key_frames. Skipping isAudioJob left audio on flat -hls_time 6.
   let forcedKeyframeString = null;
-  // Default hybrid: quality-safe if detection skipped (audio/subs/original) or fails open.
+  // Default hybrid: quality-safe if detection fails open before detectFieldStrategy returns.
   let fieldPlan = makeFieldPlan(
     'hybrid',
     'auto',
@@ -3010,7 +3024,7 @@ async function main() {
     (vps && vps.field_parity) || process.env.HLS_FIELD_PARITY || 'auto',
   );
 
-  if (kind !== 'original' && !isAudioJob && !isSubtitlesJob && !isThumbnailsJob) {
+  if (shouldComputeSegmentTimeline(kind, { isSubtitlesJob, isThumbnailsJob })) {
     try {
       fieldPlan = await detectFieldStrategy(inputSource, videoStream, startTime, {
         forceStrategy,
@@ -3029,7 +3043,11 @@ async function main() {
     }
     console.log(`FIELD_PLAN_JSON=${JSON.stringify(fieldPlan)}`);
 
-    console.log('Pre-analysis: scene cuts on post-field clock for keyframe alignment...');
+    console.log(
+      isAudioJob
+        ? 'Pre-analysis (audio job): scene cuts on post-field clock for A/V-aligned segment splits...'
+        : 'Pre-analysis: scene cuts on post-field clock for keyframe alignment...',
+    );
     try {
       const chunkDuration = (endTime !== null ? endTime : duration) - startTime;
       const sceneCuts = await detectSceneCuts(inputSource, startTime, endTime, fieldPlan);
@@ -3044,7 +3062,7 @@ async function main() {
       console.warn('Pre-analysis failed:', e);
     }
   } else {
-    fieldPlan = makeFieldPlan('progressive', 'auto', null, null, 'non-video-job');
+    fieldPlan = makeFieldPlan('progressive', 'auto', null, null, 'non-encode-job');
   }
 
   // Computed up front (not just at the final callback) so the early per-stream callback
@@ -3993,5 +4011,7 @@ if (require.main === module) {
     isHdrSource,
     normalizeFieldStrategy,
     normalizeFieldParity,
+    generateKeyframeTimeline,
+    shouldComputeSegmentTimeline,
   };
 }

@@ -15,6 +15,8 @@ const {
   isHdrSource,
   normalizeFieldStrategy,
   normalizeFieldParity,
+  generateKeyframeTimeline,
+  shouldComputeSegmentTimeline,
 } = require('./optimize.js');
 
 let passed = 0;
@@ -233,6 +235,47 @@ run('normalizeFieldParity: valid values pass through, others default to auto', (
   assertEqual(normalizeFieldParity('bff'), 'bff', 'bff passthrough');
   assertEqual(normalizeFieldParity(undefined), 'auto', 'undefined -> auto');
   assertEqual(normalizeFieldParity('xyz'), 'auto', 'unknown -> auto');
+});
+
+// ---------------------------------------------------------------------------
+// generateKeyframeTimeline / shouldComputeSegmentTimeline
+// ---------------------------------------------------------------------------
+
+run('shouldComputeSegmentTimeline: audio jobs included; original/subs/thumbs skipped', () => {
+  // Standalone audio must recompute the same grid as video (never same runner).
+  assertTrue(shouldComputeSegmentTimeline('compressed', {}), 'compressed video job');
+  assertTrue(
+    shouldComputeSegmentTimeline('compressed', { isSubtitlesJob: false, isThumbnailsJob: false }),
+    'compressed audio job (same gate)',
+  );
+  assertFalse(shouldComputeSegmentTimeline('original', {}), 'original remux skips grid');
+  assertFalse(
+    shouldComputeSegmentTimeline('compressed', { isSubtitlesJob: true }),
+    'subtitles job skips grid',
+  );
+  assertFalse(
+    shouldComputeSegmentTimeline('compressed', { isThumbnailsJob: true }),
+    'thumbnails job skips grid',
+  );
+});
+
+run('generateKeyframeTimeline: uses scene cuts inside the 3-9s window, else targetSec', () => {
+  // Scene at 4.5s is in [3,9] from 0 -> take it; next forced at 4.5+6=10.5; no cut in window.
+  const cuts = [1.0, 4.5, 20.0];
+  const times = generateKeyframeTimeline(cuts, 30, 6, 3, 9);
+  assertEqual(times[0], 4.5, 'first cut picks scene at 4.5');
+  assertEqual(times[1], 10.5, 'second is targetSec after last (no scene in window)');
+  // Same inputs always yield the same grid (video job and audio job must agree).
+  assertEqual(
+    generateKeyframeTimeline(cuts, 30, 6, 3, 9),
+    times,
+    'deterministic for A/V separate runners',
+  );
+});
+
+run('generateKeyframeTimeline: empty scene list falls back to regular targetSec steps', () => {
+  const times = generateKeyframeTimeline([], 20, 6, 3, 9);
+  assertEqual(times, [6, 12, 18], 'flat 6s grid when no scene cuts');
 });
 
 // ---------------------------------------------------------------------------
