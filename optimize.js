@@ -2391,16 +2391,17 @@ async function main() {
   const activeLabel = process.env.ACTIVE_RESOLUTION_LABEL || data.label;
   const isAudioJob = activeLabel === 'audio' || activeLabel === 'metadata';
   const isSubtitlesJob = activeLabel === 'subtitles';
+  const isThumbnailsJob = activeLabel === 'thumbnails';
   const isMetadataJob = isAudioJob; // Keep isMetadataJob for backward compatibility
 
-  const extract_subtitles = isSubtitlesJob || (!hasSubtitlesRunner && (hasMetadataRunner ? isAudioJob : true) && 
-    (activePart && activePart.extract_subtitles !== undefined 
-      ? !!activePart.extract_subtitles 
-      : ((vps && vps.extract_subtitles !== undefined) ? !!vps.extract_subtitles : true)));
+  const extract_subtitles = !isThumbnailsJob && (isSubtitlesJob || (!hasSubtitlesRunner && (hasMetadataRunner ? isAudioJob : true) &&
+    (activePart && activePart.extract_subtitles !== undefined
+      ? !!activePart.extract_subtitles
+      : ((vps && vps.extract_subtitles !== undefined) ? !!vps.extract_subtitles : true))));
 
-  const extract_audio = !isSubtitlesJob && (hasMetadataRunner ? isAudioJob : true) && 
-    (activePart && activePart.extract_audio !== undefined 
-      ? !!activePart.extract_audio 
+  const extract_audio = !isSubtitlesJob && !isThumbnailsJob && (hasMetadataRunner ? isAudioJob : true) &&
+    (activePart && activePart.extract_audio !== undefined
+      ? !!activePart.extract_audio
       : ((vps && vps.extract_audio !== undefined) ? !!vps.extract_audio : true));
 
   // Resolve Codecs list
@@ -2698,6 +2699,36 @@ async function main() {
     }
   });
 
+  // Posts a single subtitle or audio stream's status as soon as it finishes, instead of
+  // making the VPS wait for every stream in this job (subtitle/audio jobs process all their
+  // streams sequentially in one runner) before it learns anything completed - same fix as
+  // postEarlyCodecCallback below, applied to the audio/subtitle side of the pipeline.
+  async function postPartialStreamCallback({ subtitles, audios }) {
+    const body = {
+      fileId: file_id,
+      userId: user_id,
+      label: activeLabel,
+      kind,
+      renditions: [],
+      skippedCodecs: [],
+      githubReleaseId: release_id,
+      githubReleaseIds,
+      subtitles: subtitles || [],
+      audios: audios || [],
+      token: vps_callback_token,
+      partIndex: partIndex,
+      completedSubtitleZips,
+    };
+    try {
+      await apiRequest(vps_callback_url, 'POST', { 'Content-Type': 'application/json' }, body);
+      console.log(`Early VPS callback sent for ${subtitles ? 'subtitle' : 'audio'} stream`);
+    } catch (err) {
+      // Non-fatal: the final aggregate callback still reports this stream, so a dropped
+      // early ping just means the status stays stale a bit longer.
+      console.warn(`Early stream callback failed (will still be reported at the end): ${err.message}`);
+    }
+  }
+
   // 6. Segment, Zip, and Upload Subtitles immediately per stream
   const subtitlePlaylists = [];
   if (extract_subtitles && subtitleStreams.length > 0) {
@@ -2757,6 +2788,7 @@ async function main() {
               });
 
               fs.unlinkSync(zipPath);
+              await postPartialStreamCallback({ subtitles: [subtitlePlaylists[subtitlePlaylists.length - 1]] });
             } catch (zipErr) {
               console.warn(`Warning: Failed to zip/upload bitmap subtitle stream #${streamIdx}: ${zipErr.message}`);
             } finally {
@@ -2830,6 +2862,7 @@ async function main() {
               });
 
               fs.unlinkSync(zipPath);
+              await postPartialStreamCallback({ subtitles: [subtitlePlaylists[subtitlePlaylists.length - 1]] });
             } catch (zipErr) {
               console.warn(`Warning: Failed to zip/upload subtitle stream #${streamIdx}: ${zipErr.message}`);
             } finally {
@@ -2849,6 +2882,189 @@ async function main() {
     }
   }
  
+  // 6b. Generate thumbnail storyboard (sprite sheet + WebVTT). Runs once, Part 1 only
+  // (see optimize.yml's matrix-include guard), same one-shot shape as subtitle extraction
+  // above: single pass over the whole video regardless of which part triggered the job.
+  if (isThumbnailsJob) {
+    console.log('Generating thumbnail storyboard sprite sheet...');
+    const THUMB_INTERVAL = 10; // seconds between thumbnails
+    const THUMB_COLS = 10;
+    const THUMB_ROWS = 10;
+    const THUMB_TILE_WIDTH = 160;
+    const videoDurationVal = duration || 0;
+
+    if (videoDurationVal > 0) {
+      const spritePattern = path.join(OUTPUT_DIR, 'thumb_sprite_%03d.jpg');
+      const spriteCmd = `ffmpeg -y -nostdin -analyzeduration 100M -probesize 100M -protocol_whitelist file,http,tcp,https,tls -i "${inputSource}" -vf "fps=1/${THUMB_INTERVAL},scale=${THUMB_TILE_WIDTH}:-2,tile=${THUMB_COLS}x${THUMB_ROWS}" -q:v 4 "${spritePattern}"`;
+      console.log(`Executing thumbnail sprite command: ${spriteCmd}`);
+
+      try {
+        await execAsync(spriteCmd, { stdio: 'inherit' });
+
+        const spriteFiles = (await fs.promises.readdir(OUTPUT_DIR))
+          .filter(name => /^thumb_sprite_\d+\.jpg$/.test(name))
+          .sort();
+
+        if (spriteFiles.length > 0) {
+          // scale=-2 makes tile height data-dependent (source aspect ratio); probe the
+          // actual sheet dimensions rather than assuming a 16:9 source.
+          const firstSpritePath = path.join(OUTPUT_DIR, spriteFiles[0]);
+          const dimProbe = JSON.parse(await execAsync(
+            `ffprobe -v error -show_entries stream=width,height -of json "${firstSpritePath}"`
+          ));
+          const sheetWidth = dimProbe.streams[0].width;
+          const sheetHeight = dimProbe.streams[0].height;
+          const tileWidth = Math.round(sheetWidth / THUMB_COLS);
+          const tileHeight = Math.round(sheetHeight / THUMB_ROWS);
+
+          const totalThumbs = Math.ceil(videoDurationVal / THUMB_INTERVAL);
+          const tilesPerSheet = THUMB_COLS * THUMB_ROWS;
+
+          let vtt = 'WEBVTT\n\n';
+          for (let i = 0; i < totalThumbs; i++) {
+            const start = i * THUMB_INTERVAL;
+            const end = Math.min(start + THUMB_INTERVAL, videoDurationVal);
+            const sheetIdx = Math.floor(i / tilesPerSheet);
+            const localIdx = i % tilesPerSheet;
+            const col = localIdx % THUMB_COLS;
+            const row = Math.floor(localIdx / THUMB_COLS);
+            const sheetName = `thumb_sprite_${String(sheetIdx + 1).padStart(3, '0')}.jpg`;
+            vtt += `${formatTimestamp(start)} --> ${formatTimestamp(end)}\n`;
+            // "thumbnails/" prefix (not just the bare filename): @videojs/react resolves
+            // this cue reference relative to the <track src> URL (.../hls/thumbnails.vtt),
+            // and relative resolution drops the last path segment - so a bare filename
+            // would resolve to .../hls/<file>.jpg, not the .../hls/thumbnails/<file>.jpg
+            // route this same worker's sprite files are actually served from.
+            vtt += `thumbnails/${sheetName}#xywh=${col * tileWidth},${row * tileHeight},${tileWidth},${tileHeight}\n\n`;
+          }
+
+          const vttPath = path.join(OUTPUT_DIR, 'thumbnails.vtt');
+          await fs.promises.writeFile(vttPath, vtt, 'utf8');
+
+          // Zip the VTT + every sprite sheet together as a single asset, same
+          // zip-then-upload-then-cleanup shape as the subtitle ZIPs above.
+          const zipName = 'thumbnails.zip';
+          const zipPath = path.join(WORK_DIR, zipName);
+          const listFilePath = path.join(WORK_DIR, `${zipName}.list.txt`);
+          const filesForZip = [vttPath, ...spriteFiles.map(f => path.join(OUTPUT_DIR, f))];
+          fs.writeFileSync(listFilePath, filesForZip.join('\n'), 'utf8');
+
+          try {
+            execSync(`zip -0 -j "${zipPath}" -@ < "${listFilePath}"`, { stdio: 'ignore' });
+
+            const zipSize = (await fs.promises.stat(zipPath)).size;
+            console.log(`Uploading thumbnail ZIP ${zipName} (${(zipSize / 1024).toFixed(1)} KB)...`);
+            const uploadRes = await uploadAssetWithRotation(zipName, zipPath, 'application/zip');
+
+            completedSubtitleZips.push({
+              zipType: 'thumbnail',
+              streamIndex: 0,
+              zipIndex: 0,
+              assetId: uploadRes.id,
+              url: uploadRes.browser_download_url,
+              zipSize,
+              // Sent alongside the zip so the backend can serve/rewrite it (e.g. append
+              // ?pwd= for password-protected shares) without a round-trip zip fetch of
+              // its own - we already have it in memory right here.
+              vttText: vtt
+            });
+
+            fs.unlinkSync(zipPath);
+          } catch (zipErr) {
+            console.warn(`Warning: Failed to zip/upload thumbnail sprite sheet: ${zipErr.message}`);
+          } finally {
+            try { fs.unlinkSync(listFilePath); } catch (e) {}
+            try { fs.unlinkSync(vttPath); } catch (e) {}
+            for (const f of spriteFiles) {
+              try { fs.unlinkSync(path.join(OUTPUT_DIR, f)); } catch (e) {}
+            }
+          }
+        } else {
+          console.warn('Warning: No thumbnail sprite sheets were generated.');
+        }
+      } catch (err) {
+        console.warn(`Warning: Failed to generate thumbnail sprite sheet: ${err.message}`);
+      }
+    } else {
+      console.warn('Warning: Unknown video duration; skipping thumbnail sprite generation.');
+    }
+  }
+
+  // Computed here, ahead of audio segmenting below, so audio can be cut at the same
+  // scene-aligned points as video instead of its own flat interval - see the aligned
+  // branch in the audio ffmpeg command for why that matters.
+  let forcedKeyframeString = null;
+  // Default hybrid: quality-safe if detection skipped (audio/subs/original) or fails open.
+  let fieldPlan = makeFieldPlan(
+    'hybrid',
+    'auto',
+    buildBwdifFilter('send_frame', 'auto'),
+    null,
+    'default-before-detect',
+  );
+
+  const forceStrategy = normalizeFieldStrategy(
+    (vps && vps.field_strategy) || process.env.HLS_FIELD_STRATEGY || 'auto',
+  );
+  const forceParity = normalizeFieldParity(
+    (vps && vps.field_parity) || process.env.HLS_FIELD_PARITY || 'auto',
+  );
+
+  if (kind !== 'original' && !isAudioJob && !isSubtitlesJob && !isThumbnailsJob) {
+    try {
+      fieldPlan = await detectFieldStrategy(inputSource, videoStream, startTime, {
+        forceStrategy,
+        forceParity,
+        endTime: endTime !== null ? endTime : duration,
+      });
+    } catch (e) {
+      console.warn('Field detection failed, keeping hybrid bwdif:', e.message || e);
+      fieldPlan = makeFieldPlan(
+        'hybrid',
+        forceParity === 'auto' ? 'auto' : forceParity,
+        buildBwdifFilter('send_frame', forceParity),
+        null,
+        'detect-error-fail-open',
+      );
+    }
+    console.log(`FIELD_PLAN_JSON=${JSON.stringify(fieldPlan)}`);
+
+    console.log('Pre-analysis: scene cuts on post-field clock for keyframe alignment...');
+    try {
+      const chunkDuration = (endTime !== null ? endTime : duration) - startTime;
+      const sceneCuts = await detectSceneCuts(inputSource, startTime, endTime, fieldPlan);
+      const forcedTimestamps = generateKeyframeTimeline(sceneCuts, chunkDuration, 6, 3, 9);
+      if (forcedTimestamps.length > 0) {
+        forcedKeyframeString = forcedTimestamps.map(t => t.toFixed(3)).join(',');
+        console.log(`Generated timeline with ${forcedTimestamps.length} keyframe alignment points: ${forcedKeyframeString}`);
+      } else {
+        console.log('No keyframe alignment points generated, falling back to default keyframes.');
+      }
+    } catch (e) {
+      console.warn('Pre-analysis failed:', e);
+    }
+  } else {
+    fieldPlan = makeFieldPlan('progressive', 'auto', null, null, 'non-video-job');
+  }
+
+  // Computed up front (not just at the final callback) so the early per-stream callback
+  // below can report the correct isDefault immediately instead of a transient wrong value
+  // that only gets fixed once the job's last stream finishes.
+  let defaultAudioIndex = null;
+  {
+    const defaultAuds = audioStreams.filter(aud => aud.disposition && aud.disposition.default === 1);
+    if (defaultAuds.length > 0) {
+      if (defaultAuds.length > 1) {
+        console.warn(`[HLS] Collision: Multiple audio streams marked default. Selecting lowest stream index.`);
+      }
+      const sorted = [...defaultAuds].sort((a, b) => a.index - b.index);
+      defaultAudioIndex = sorted[0].index;
+    } else if (audioStreams.length > 0) {
+      const sorted = [...audioStreams].sort((a, b) => a.index - b.index);
+      defaultAudioIndex = sorted[0].index;
+    }
+  }
+
   // 7. Segment Audio next (always process if present, for all variant kinds)
   const audioPlaylists = [];
   if (extract_audio && audioStreams.length > 0) {
@@ -2873,6 +3089,14 @@ async function main() {
         targetAudioBitrate = Math.min(320, Math.max(96, Math.round((channels / 2) * hls_audio_bitrate)));
       }
 
+      // Video cuts segments at scene-aligned, variable-length points (forcedKeyframeString,
+      // 3-9s). Flat -hls_time 6 on audio widens the gap-jump window hls.js has to bridge
+      // on every seek, since the two tracks' segment boundaries never line up. When we
+      // have that timeline, cut audio at the exact same points instead.
+      const useAlignedSplits = !!forcedKeyframeString;
+      const audSegmentPatternAligned = path.join(OUTPUT_DIR, `audio_${aud.index}_%05d.mp4`);
+      const audSegmentListTmpPath = path.join(OUTPUT_DIR, `audio_${aud.index}_list.m3u8.tmp`);
+
       const audFfmpegArgs = [
         'ffmpeg',
         '-y',
@@ -2895,15 +3119,7 @@ async function main() {
         '-vn',
         '-map', `0:${aud.index}`,
         '-c:a', 'aac',
-        '-b:a', `${targetAudioBitrate}k`,
-        '-f', 'hls',
-        '-hls_time', '6',
-        '-hls_playlist_type', 'vod',
-        '-hls_segment_type', 'fmp4',
-        '-hls_segment_filename', `"${audSegmentPattern}"`,
-        '-hls_fmp4_init_filename', `"${audInitName}"`,
-        '-hls_flags', 'independent_segments',
-        '-start_number', startSegmentIndex.toString()
+        '-b:a', `${targetAudioBitrate}k`
       );
       // Audio beyond 7.1 (e.g. Atmos 7.1.2 / 7.1.4 with up to 12 channels) produces
       // channel_configuration >= 12 which ISO 14496-3:2009 Table 1.19 leaves undefined;
@@ -2911,13 +3127,84 @@ async function main() {
       if (aud.channels > 8) {
         audFfmpegArgs.push('-ac', '2');
       }
-      audFfmpegArgs.push(`"${audPlaylistPath}"`);
+
+      if (useAlignedSplits) {
+        // The generic segment muxer (unlike -f hls) has no notion of a shared fmp4 init
+        // segment in its own playlist writer, and it refuses to guess a container for a
+        // ".m4s" output pattern even with -segment_format set explicitly - both are
+        // worked around below once ffmpeg exits: segments land as .mp4 and get renamed,
+        // and EXT-X-MAP is added by hand since ffmpeg never writes one here.
+        audFfmpegArgs.push(
+          '-f', 'segment',
+          '-segment_times', forcedKeyframeString,
+          '-segment_format', 'mp4',
+          '-segment_format_options', 'movflags=+frag_keyframe+empty_moov+default_base_moof',
+          '-segment_header_filename', `"${audInitName}"`,
+          '-reset_timestamps', '0',
+          '-segment_list_type', 'hls',
+          '-segment_list', `"${audSegmentListTmpPath}"`,
+          '-segment_start_number', startSegmentIndex.toString(),
+          `"${audSegmentPatternAligned}"`
+        );
+      } else {
+        audFfmpegArgs.push(
+          '-f', 'hls',
+          '-hls_time', '6',
+          '-hls_playlist_type', 'vod',
+          '-hls_segment_type', 'fmp4',
+          '-hls_segment_filename', `"${audSegmentPattern}"`,
+          '-hls_fmp4_init_filename', `"${audInitName}"`,
+          '-hls_flags', 'independent_segments',
+          '-start_number', startSegmentIndex.toString(),
+          `"${audPlaylistPath}"`
+        );
+      }
       const audFfmpegCmd = audFfmpegArgs.flat().join(' ');
       console.log(`Executing Audio FFmpeg command: ${audFfmpegCmd}`);
-      
+
       try {
         await execAsync(audFfmpegCmd, { stdio: 'inherit' });
-        const rawAudPlaylist = fs.readFileSync(audPlaylistPath, 'utf8');
+
+        let rawAudPlaylist;
+        if (useAlignedSplits) {
+          // ffmpeg computed real, frame-accurate durations for each split point - reuse
+          // those verbatim rather than trusting our own requested timestamps, just
+          // rename the segment references from .mp4 to the .m4s name the rest of this
+          // pipeline (zip packaging, serve-side regexes) already expects.
+          const listRaw = fs.readFileSync(audSegmentListTmpPath, 'utf8');
+          const segLines = [];
+          let maxSeconds = 0;
+          const lines = listRaw.split('\n');
+          for (let i = 0; i < lines.length; i++) {
+            const extinf = /^#EXTINF:\s*([0-9.]+)/.exec(lines[i].trim());
+            if (!extinf) continue;
+            const seconds = parseFloat(extinf[1]);
+            if (Number.isFinite(seconds)) maxSeconds = Math.max(maxSeconds, seconds);
+            const mp4Name = (lines[i + 1] || '').trim();
+            if (!mp4Name) continue;
+            const m4sName = mp4Name.replace(/\.mp4$/, '.m4s');
+            fs.renameSync(path.join(OUTPUT_DIR, mp4Name), path.join(OUTPUT_DIR, m4sName));
+            segLines.push(`#EXTINF:${seconds.toFixed(6)},`, m4sName);
+            i++;
+          }
+          fs.unlinkSync(audSegmentListTmpPath);
+
+          rawAudPlaylist = [
+            '#EXTM3U',
+            '#EXT-X-VERSION:7',
+            `#EXT-X-TARGETDURATION:${Math.max(1, Math.ceil(maxSeconds))}`,
+            `#EXT-X-MEDIA-SEQUENCE:${startSegmentIndex}`,
+            '#EXT-X-PLAYLIST-TYPE:VOD',
+            '#EXT-X-INDEPENDENT-SEGMENTS',
+            `#EXT-X-MAP:URI="${audInitName}"`,
+            ...segLines,
+            '#EXT-X-ENDLIST',
+            '',
+          ].join('\n');
+        } else {
+          rawAudPlaylist = fs.readFileSync(audPlaylistPath, 'utf8');
+        }
+
         audioPlaylists.push({
           streamIndex: aud.index,
           language: aud.language,
@@ -3007,67 +3294,23 @@ async function main() {
           }
         }
         await flush();
+        await postPartialStreamCallback({
+          audios: [{
+            streamIndex: aud.index,
+            language: aud.language,
+            title: aud.title,
+            isDefault: aud.index === defaultAudioIndex,
+            disposition: aud.disposition || null,
+            playlistUrl: undefined,
+            playlistText: rawAudPlaylist,
+          }],
+        });
       } catch (err) {
         console.warn(`Warning: Failed to convert audio stream #${aud.index}: ${err.message}. Skipping.`);
       }
     }
   }
 
-
-
-  let forcedKeyframeString = null;
-  // Default hybrid: quality-safe if detection skipped (audio/subs/original) or fails open.
-  let fieldPlan = makeFieldPlan(
-    'hybrid',
-    'auto',
-    buildBwdifFilter('send_frame', 'auto'),
-    null,
-    'default-before-detect',
-  );
-
-  const forceStrategy = normalizeFieldStrategy(
-    (vps && vps.field_strategy) || process.env.HLS_FIELD_STRATEGY || 'auto',
-  );
-  const forceParity = normalizeFieldParity(
-    (vps && vps.field_parity) || process.env.HLS_FIELD_PARITY || 'auto',
-  );
-
-  if (kind !== 'original' && !isAudioJob && !isSubtitlesJob) {
-    try {
-      fieldPlan = await detectFieldStrategy(inputSource, videoStream, startTime, {
-        forceStrategy,
-        forceParity,
-        endTime: endTime !== null ? endTime : duration,
-      });
-    } catch (e) {
-      console.warn('Field detection failed, keeping hybrid bwdif:', e.message || e);
-      fieldPlan = makeFieldPlan(
-        'hybrid',
-        forceParity === 'auto' ? 'auto' : forceParity,
-        buildBwdifFilter('send_frame', forceParity),
-        null,
-        'detect-error-fail-open',
-      );
-    }
-    console.log(`FIELD_PLAN_JSON=${JSON.stringify(fieldPlan)}`);
-
-    console.log('Pre-analysis: scene cuts on post-field clock for keyframe alignment...');
-    try {
-      const chunkDuration = (endTime !== null ? endTime : duration) - startTime;
-      const sceneCuts = await detectSceneCuts(inputSource, startTime, endTime, fieldPlan);
-      const forcedTimestamps = generateKeyframeTimeline(sceneCuts, chunkDuration, 6, 3, 9);
-      if (forcedTimestamps.length > 0) {
-        forcedKeyframeString = forcedTimestamps.map(t => t.toFixed(3)).join(',');
-        console.log(`Generated timeline with ${forcedTimestamps.length} keyframe alignment points: ${forcedKeyframeString}`);
-      } else {
-        console.log('No keyframe alignment points generated, falling back to default keyframes.');
-      }
-    } catch (e) {
-      console.warn('Pre-analysis failed:', e);
-    }
-  } else {
-    fieldPlan = makeFieldPlan('progressive', 'auto', null, null, 'non-video-job');
-  }
   let manifestsUploaded = false;
 
   const resPromises = resolutions.map(async (currentRes) => {
@@ -3087,6 +3330,7 @@ async function main() {
 
     const isAudioJobLocal = (label === 'metadata' || label === 'audio');
     const isSubtitlesJobLocal = (label === 'subtitles');
+    const isThumbnailsJobLocal = (label === 'thumbnails');
 
     console.log(`\n============================================================`);
     console.log(`Processing resolution: ${label} (${target_height || 'source'}p)`);
@@ -3444,12 +3688,50 @@ async function main() {
     };
   }
 
-  if (!isMetadataJob && !isSubtitlesJob) {
+  // Posts a single rendition's status as soon as its codec finishes, instead of making
+  // the VPS wait for every codec in this resolution's matrix job (e.g. av1 running long
+  // after h264 already finished) before it learns anything completed.
+  async function postEarlyCodecCallback(result) {
+    const body = {
+      fileId: file_id,
+      userId: user_id,
+      label,
+      kind,
+      renditions: [{
+        codec: result.codec,
+        width: result.outputWidth,
+        height: result.outputHeight,
+        measuredBandwidth: result.measuredBandwidth,
+        playlistUrl: result.playlistUrl,
+        playlistText: result.playlistText,
+        completedZips: result.completedZips,
+        disposition: videoStream ? videoStream.disposition : null
+      }],
+      skippedCodecs: [],
+      githubReleaseId: release_id,
+      githubReleaseIds,
+      subtitles: [],
+      audios: [],
+      token: vps_callback_token,
+      partIndex: partIndex,
+    };
+    try {
+      await apiRequest(vps_callback_url, 'POST', { 'Content-Type': 'application/json' }, body);
+      console.log(`Early VPS callback sent for resolution ${label}, codec ${result.codec}`);
+    } catch (err) {
+      // Non-fatal: the final aggregate callback below still reports this rendition,
+      // so a dropped early ping just means the status stays stale a bit longer.
+      console.warn(`Early callback for ${label}/${result.codec} failed (will still be reported at the end): ${err.message}`);
+    }
+  }
+
+  if (!isMetadataJob && !isSubtitlesJob && !isThumbnailsJob) {
     for (const codec of resolvedCodecs) {
       try {
         const result = await processCodecJob(codec);
         if (result) {
           codecResults.push(result);
+          await postEarlyCodecCallback(result);
         }
       } catch (err) {
         console.warn(`Warning: Failed to process job for codec ${codec}:`, err);
@@ -3489,8 +3771,8 @@ async function main() {
       console.log('Rewriting and uploading subtitle/audio manifests to absolute paths...');
       
       let activeLabel = label;
-      if (isAudioJobLocal || isSubtitlesJobLocal) {
-        const primaryVideoRes = rawResolutions.find(r => r.label !== 'metadata' && r.label !== 'audio' && r.label !== 'subtitles') || rawResolutions[0];
+      if (isAudioJobLocal || isSubtitlesJobLocal || isThumbnailsJobLocal) {
+        const primaryVideoRes = rawResolutions.find(r => r.label !== 'metadata' && r.label !== 'audio' && r.label !== 'subtitles' && r.label !== 'thumbnails') || rawResolutions[0];
         const primaryCodec = resolvedCodecs[0] || 'h264';
         const useCodecSuffix = resolvedCodecs.length > 1;
         activeLabel = useCodecSuffix ? `${primaryVideoRes.label}_${primaryCodec}` : primaryVideoRes.label;
@@ -3544,19 +3826,6 @@ async function main() {
 
     // 10. Callback to VPS to notify completeness
     console.log(`Sending success callback to VPS for resolution ${label}...`);
-
-    let defaultAudioIndex = null;
-    const defaultAuds = audioStreams.filter(aud => aud.disposition && aud.disposition.default === 1);
-    if (defaultAuds.length > 0) {
-      if (defaultAuds.length > 1) {
-        console.warn(`[HLS] Collision: Multiple audio streams marked default. Selecting lowest stream index.`);
-      }
-      const sorted = [...defaultAuds].sort((a, b) => a.index - b.index);
-      defaultAudioIndex = sorted[0].index;
-    } else if (audioStreams.length > 0) {
-      const sorted = [...audioStreams].sort((a, b) => a.index - b.index);
-      defaultAudioIndex = sorted[0].index;
-    }
 
     const audiosForCallback = audioStreams.map((aud) => {
       const rawPlaylist = rewrittenAudioPlaylists.find(p => p.streamIndex === aud.index);

@@ -26,8 +26,8 @@ jobs:
             if (include.length === 0) {
               for (const r of resolutions) {
                 for (const p of parts) {
-                  if (r.label === "subtitles" && p.part_index > 1) {
-                    continue; // Only run subtitles for Part 1
+                  if ((r.label === "subtitles" || r.label === "thumbnails") && p.part_index > 1) {
+                    continue; // Only run subtitles/thumbnails for Part 1
                   }
                   include.push({ resolution: r, part: p });
                 }
