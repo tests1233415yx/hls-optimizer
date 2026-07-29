@@ -1691,32 +1691,42 @@ async function runIdetSample(inputSource, seekSeconds, sampleSeconds) {
 }
 
 async function sampleInterlaceWithIdet(inputSource, startTime, sampleSeconds = 10) {
-  // Dense windows: logos/black at 0, action later, mid-part, deep part.
+  // Dense windows: logos at 0 often lie (clean progressive card); body may differ.
   const offsets = [0, 12, 45, 120, 240];
   let merged = { tff: 0, bff: 0, progressive: 0, undetermined: 0 };
   let any = false;
-  let decisiveHits = 0;
+  let progHits = 0;
+  let interHits = 0;
+  let teleHits = 0;
+  let windows = 0;
 
   for (const rel of offsets) {
     const seek = Math.max(0, startTime + rel);
     const stats = await runIdetSample(inputSource, seek, sampleSeconds);
     if (!stats || idetStatsDetermined(stats) + (stats.undetermined || 0) === 0) continue;
     any = true;
+    windows += 1;
     merged.tff += stats.tff;
     merged.bff += stats.bff;
     merged.progressive += stats.progressive;
     merged.undetermined += stats.undetermined;
 
-    const decisive =
-      isConfidentlyProgressiveFromIdet(stats) ||
-      isConfidentlyInterlacedFromIdet(stats) ||
-      isTelecineLikeIdet(stats);
-    if (decisive) decisiveHits += 1;
+    if (isConfidentlyInterlacedFromIdet(stats)) interHits += 1;
+    else if (isTelecineLikeIdet(stats)) teleHits += 1;
+    else if (isConfidentlyProgressiveFromIdet(stats)) progHits += 1;
 
-    // Need 2 agreeing decisive windows OR a large classified pool.
-    if (decisiveHits >= 2 || idetStatsDetermined(merged) >= 90) {
+    // Interlaced / telecine-like: 2 windows enough.
+    // Progressive alone: need 3 windows — One Piece-style opens are clean progressive
+    // while the body still has woven combing idet mislabels as progressive.
+    if (interHits >= 2 || teleHits >= 2) {
       console.log(
-        `idet stop @+${rel}s hits=${decisiveHits} → TFF=${merged.tff} BFF=${merged.bff} Progressive=${merged.progressive} Undetermined=${merged.undetermined}`,
+        `idet stop @+${rel}s inter=${interHits} tele=${teleHits} prog=${progHits} → TFF=${merged.tff} BFF=${merged.bff} Progressive=${merged.progressive} Undetermined=${merged.undetermined}`,
+      );
+      return merged;
+    }
+    if (progHits >= 3 && windows >= 3 && interHits === 0 && teleHits === 0) {
+      console.log(
+        `idet stop @+${rel}s progressive x${progHits} → TFF=${merged.tff} BFF=${merged.bff} Progressive=${merged.progressive} Undetermined=${merged.undetermined}`,
       );
       return merged;
     }
@@ -1724,7 +1734,7 @@ async function sampleInterlaceWithIdet(inputSource, startTime, sampleSeconds = 1
 
   if (!any) return null;
   console.log(
-    `idet aggregated: TFF=${merged.tff} BFF=${merged.bff} Progressive=${merged.progressive} Undetermined=${merged.undetermined}`,
+    `idet aggregated (windows=${windows}): TFF=${merged.tff} BFF=${merged.bff} Progressive=${merged.progressive} Undetermined=${merged.undetermined}`,
   );
   return merged;
 }
@@ -1907,7 +1917,7 @@ async function detectFieldStrategy(inputSource, videoStream, startTime, options 
     return plan;
   }
 
-  // True film progressive masters.
+  // True film progressive masters (typical clean 4K movies).
   if (isFilmFps(sourceFps) && isConfidentlyProgressiveFromIdet(stats)) {
     const plan = makeFieldPlan('progressive', parity, null, null, 'film progressive');
     console.log(`Field strategy: ${JSON.stringify(plan)}`);
@@ -1921,37 +1931,7 @@ async function detectFieldStrategy(inputSource, videoStream, startTime, options 
     return plan;
   }
 
-  // Hard telecine (NTSC 29.97 woven 3:2) — prefer IVTC over bwdif.
-  const telecineCandidate =
-    isNtsc30Family(rFps || sourceFps) &&
-    !isConfidentlyInterlacedFromIdet(stats) &&
-    (isTelecineLikeIdet(stats) || !isConfidentlyProgressiveFromIdet(stats) || !stats);
-
-  if (telecineCandidate) {
-    try {
-      if (await probeTelecine(inputSource, startTime, parity)) {
-        const plan = makeFieldPlan(
-          'telecine',
-          parity,
-          buildIvtcFilter(parity),
-          '24000/1001',
-          'hard 3:2 pulldown',
-        );
-        console.log(`Field strategy: ${JSON.stringify(plan)}`);
-        return plan;
-      }
-    } catch (e) {
-      console.warn('Telecine probe failed:', e.message || e);
-    }
-  }
-
-  if (isConfidentlyProgressiveFromIdet(stats)) {
-    const plan = makeFieldPlan('progressive', parity, null, null, 'idet progressive');
-    console.log(`Field strategy: ${JSON.stringify(plan)}`);
-    return plan;
-  }
-
-  // True interlaced (NTSC 29.97i / PAL 25i) → bob.
+  // True interlaced (NTSC 29.97i / PAL 25i) → bob to double rate.
   if (isConfidentlyInterlacedFromIdet(stats)) {
     const plan = makeFieldPlan(
       'interlaced',
@@ -1964,7 +1944,60 @@ async function detectFieldStrategy(inputSource, videoStream, startTime, options 
     return plan;
   }
 
-  // Fail-open hybrid: progressive-tagged combing (old anime rips etc.).
+  // -------------------------------------------------------------------------
+  // NTSC ~29.97 (old TV / anime, e.g. One Piece):
+  // Container often says progressive; idet often says progressive too even when
+  // frames still have woven combing or hard 3:2 telecine. Skipping field restore
+  // left visible combing. Always probe telecine; otherwise hybrid bwdif — never
+  // bare progressive-skip on this rate family.
+  // -------------------------------------------------------------------------
+  const ntsc30 = isNtsc30Family(rFps) || isNtsc30Family(sourceFps);
+  if (ntsc30) {
+    let isTc = false;
+    try {
+      isTc = await probeTelecine(inputSource, startTime, parity);
+    } catch (e) {
+      console.warn('Telecine probe failed:', e.message || e);
+    }
+
+    if (isTc || isTelecineLikeIdet(stats)) {
+      // Prefer IVTC when probe or idet mix says 3:2; probe wins when true.
+      if (isTc) {
+        const plan = makeFieldPlan(
+          'telecine',
+          parity,
+          buildIvtcFilter(parity),
+          '24000/1001',
+          'NTSC 29.97 hard 3:2 pulldown',
+        );
+        console.log(`Field strategy: ${JSON.stringify(plan)}`);
+        return plan;
+      }
+    }
+
+    // Not clean film telecine (or probe weak): deinterlace every frame at source fps.
+    // This is what fixed combing when bare skip looked bad — bwdif deint=all, send_frame.
+    const plan = makeFieldPlan(
+      'hybrid',
+      parity,
+      buildBwdifFilter('send_frame', parity),
+      fpsToRateString(sourceFps) || '30000/1001',
+      isTc
+        ? 'NTSC telecine-like fallback hybrid'
+        : 'NTSC 29.97 progressive-tagged → hybrid bwdif (no skip)',
+    );
+    console.log(`Field strategy: ${JSON.stringify(plan)}`);
+    return plan;
+  }
+
+  // Non-NTSC: progressive idet can skip (film already handled; other rates).
+  if (isConfidentlyProgressiveFromIdet(stats)) {
+    const plan = makeFieldPlan('progressive', parity, null, null, 'idet progressive');
+    console.log(`Field strategy: ${JSON.stringify(plan)}`);
+    return plan;
+  }
+
+  // Fail-open hybrid for anything else unknown.
   const plan = makeFieldPlan(
     'hybrid',
     parity,
