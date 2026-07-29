@@ -1931,7 +1931,60 @@ async function detectFieldStrategy(inputSource, videoStream, startTime, options 
     return plan;
   }
 
-  // True interlaced (NTSC 29.97i / PAL 25i) → bob to double rate.
+  // -------------------------------------------------------------------------
+  // NTSC ~29.97 (ADN/webrip anime, old TV):
+  // Run BEFORE generic interlaced bob. Telecine content often looks "interlaced"
+  // to idet (high TFF); IVTC is better for film anime when probe hits. Else bob
+  // or hybrid — never progressive-skip on this rate (combing stays).
+  // -------------------------------------------------------------------------
+  const ntsc30 = isNtsc30Family(rFps) || isNtsc30Family(sourceFps);
+  if (ntsc30) {
+    let isTc = false;
+    try {
+      isTc = await probeTelecine(inputSource, startTime, parity);
+    } catch (e) {
+      console.warn('Telecine probe failed:', e.message || e);
+    }
+
+    if (isTc) {
+      const plan = makeFieldPlan(
+        'telecine',
+        parity,
+        buildIvtcFilter(parity),
+        '24000/1001',
+        'NTSC 29.97 hard 3:2 pulldown',
+      );
+      console.log(`Field strategy: ${JSON.stringify(plan)}`);
+      return plan;
+    }
+
+    // Strong field dominance → bob to 60p (cleans combing, smooth motion).
+    if (isConfidentlyInterlacedFromIdet(stats)) {
+      const plan = makeFieldPlan(
+        'interlaced',
+        parity,
+        buildBwdifFilter('send_field', parity),
+        bobOutRate(sourceFps),
+        'NTSC 29.97 idet interlaced (telecine probe negative)',
+      );
+      console.log(`Field strategy: ${JSON.stringify(plan)}`);
+      return plan;
+    }
+
+    // Progressive-tagged webrip with residual combing (common ADN/old TV):
+    // bwdif every frame at source fps — same class of fix as "looks bad without bwdif".
+    const plan = makeFieldPlan(
+      'hybrid',
+      parity,
+      buildBwdifFilter('send_frame', parity),
+      fpsToRateString(sourceFps) || '30000/1001',
+      'NTSC 29.97 progressive-tagged → hybrid bwdif (no skip)',
+    );
+    console.log(`Field strategy: ${JSON.stringify(plan)}`);
+    return plan;
+  }
+
+  // Non-NTSC true interlaced (e.g. PAL 25i) → bob.
   if (isConfidentlyInterlacedFromIdet(stats)) {
     const plan = makeFieldPlan(
       'interlaced',
@@ -1944,60 +1997,14 @@ async function detectFieldStrategy(inputSource, videoStream, startTime, options 
     return plan;
   }
 
-  // -------------------------------------------------------------------------
-  // NTSC ~29.97 (old TV / anime, e.g. One Piece):
-  // Container often says progressive; idet often says progressive too even when
-  // frames still have woven combing or hard 3:2 telecine. Skipping field restore
-  // left visible combing. Always probe telecine; otherwise hybrid bwdif — never
-  // bare progressive-skip on this rate family.
-  // -------------------------------------------------------------------------
-  const ntsc30 = isNtsc30Family(rFps) || isNtsc30Family(sourceFps);
-  if (ntsc30) {
-    let isTc = false;
-    try {
-      isTc = await probeTelecine(inputSource, startTime, parity);
-    } catch (e) {
-      console.warn('Telecine probe failed:', e.message || e);
-    }
-
-    if (isTc || isTelecineLikeIdet(stats)) {
-      // Prefer IVTC when probe or idet mix says 3:2; probe wins when true.
-      if (isTc) {
-        const plan = makeFieldPlan(
-          'telecine',
-          parity,
-          buildIvtcFilter(parity),
-          '24000/1001',
-          'NTSC 29.97 hard 3:2 pulldown',
-        );
-        console.log(`Field strategy: ${JSON.stringify(plan)}`);
-        return plan;
-      }
-    }
-
-    // Not clean film telecine (or probe weak): deinterlace every frame at source fps.
-    // This is what fixed combing when bare skip looked bad — bwdif deint=all, send_frame.
-    const plan = makeFieldPlan(
-      'hybrid',
-      parity,
-      buildBwdifFilter('send_frame', parity),
-      fpsToRateString(sourceFps) || '30000/1001',
-      isTc
-        ? 'NTSC telecine-like fallback hybrid'
-        : 'NTSC 29.97 progressive-tagged → hybrid bwdif (no skip)',
-    );
-    console.log(`Field strategy: ${JSON.stringify(plan)}`);
-    return plan;
-  }
-
-  // Non-NTSC: progressive idet can skip (film already handled; other rates).
+  // Non-NTSC progressive idet can skip.
   if (isConfidentlyProgressiveFromIdet(stats)) {
     const plan = makeFieldPlan('progressive', parity, null, null, 'idet progressive');
     console.log(`Field strategy: ${JSON.stringify(plan)}`);
     return plan;
   }
 
-  // Fail-open hybrid for anything else unknown.
+  // Fail-open hybrid.
   const plan = makeFieldPlan(
     'hybrid',
     parity,
