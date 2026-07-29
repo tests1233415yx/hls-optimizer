@@ -2301,6 +2301,84 @@ function shouldComputeSegmentTimeline(kind, { isSubtitlesJob = false, isThumbnai
   return kind !== 'original' && !isSubtitlesJob && !isThumbnailsJob;
 }
 
+// Storyboard scrub previews: single resolution, denser than the old 10s×160 JPEG grid.
+// 10×10 keeps ~100 tiles/sheet so ~25 min @ 5s ≈ 3 sheets without multi‑megapixel 16×16 sheets.
+const THUMB_STORYBOARD = Object.freeze({
+  intervalSec: 5,
+  tileWidth: 320,
+  cols: 10,
+  rows: 10,
+  extension: 'avif',
+  // libaom still encode: higher cpu-used = faster/slightly larger; CRF ~32 is small & sharp at 320px.
+  avifCpuUsed: 6,
+  avifCrf: 32,
+});
+
+function countStoryboardThumbs(durationSec, intervalSec = THUMB_STORYBOARD.intervalSec) {
+  if (!(durationSec > 0) || !(intervalSec > 0)) return 0;
+  return Math.ceil(durationSec / intervalSec);
+}
+
+function storyboardTilesPerSheet(cols = THUMB_STORYBOARD.cols, rows = THUMB_STORYBOARD.rows) {
+  return cols * rows;
+}
+
+/** 0-based thumb index → 0-based sheet index */
+function storyboardSheetIndexForThumb(thumbIndex0, cols = THUMB_STORYBOARD.cols, rows = THUMB_STORYBOARD.rows) {
+  const per = storyboardTilesPerSheet(cols, rows);
+  if (per <= 0 || thumbIndex0 < 0) return 0;
+  return Math.floor(thumbIndex0 / per);
+}
+
+/** 0-based sheet index → thumb_sprite_001.avif style name */
+function storyboardSheetName(sheetIndex0, extension = THUMB_STORYBOARD.extension) {
+  return `thumb_sprite_${String(sheetIndex0 + 1).padStart(3, '0')}.${extension}`;
+}
+
+/**
+ * Build WebVTT storyboard cues (no WEBVTT header). tileWidth/tileHeight are the
+ * per-cell sizes after scale+tile (probed from the first sheet in production).
+ */
+function buildStoryboardVttBody(durationSec, tileWidth, tileHeight, opts = {}) {
+  const intervalSec = opts.intervalSec ?? THUMB_STORYBOARD.intervalSec;
+  const cols = opts.cols ?? THUMB_STORYBOARD.cols;
+  const rows = opts.rows ?? THUMB_STORYBOARD.rows;
+  const extension = opts.extension ?? THUMB_STORYBOARD.extension;
+  const totalThumbs = countStoryboardThumbs(durationSec, intervalSec);
+  const tilesPerSheet = storyboardTilesPerSheet(cols, rows);
+  let vtt = '';
+  for (let i = 0; i < totalThumbs; i++) {
+    const start = i * intervalSec;
+    const end = Math.min(start + intervalSec, durationSec);
+    const sheetIdx = storyboardSheetIndexForThumb(i, cols, rows);
+    const localIdx = i % tilesPerSheet;
+    const col = localIdx % cols;
+    const row = Math.floor(localIdx / cols);
+    const sheetName = storyboardSheetName(sheetIdx, extension);
+    vtt += `${formatTimestamp(start)} --> ${formatTimestamp(end)}\n`;
+    vtt += `thumbnails/${sheetName}#xywh=${col * tileWidth},${row * tileHeight},${tileWidth},${tileHeight}\n\n`;
+  }
+  return vtt;
+}
+
+function storyboardSpriteGlob(extension = THUMB_STORYBOARD.extension) {
+  // Escape for RegExp; extension is a fixed constant (avif) in production.
+  const esc = String(extension).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`^thumb_sprite_\\d+\\.${esc}$`);
+}
+
+function hasLibaomAv1Encoder() {
+  try {
+    const out = execSync('ffmpeg -hide_banner -encoders 2>&1', {
+      encoding: 'utf8',
+      maxBuffer: 2 * 1024 * 1024,
+    });
+    return /\blibaom-av1\b/.test(out);
+  } catch {
+    return false;
+  }
+}
+
 async function main() {
   isGlobalAborted = false;
   let payloadStr = process.env.EVENT_PAYLOAD;
@@ -2897,22 +2975,47 @@ async function main() {
   // above: single pass over the whole video regardless of which part triggered the job.
   if (isThumbnailsJob) {
     console.log('Generating thumbnail storyboard sprite sheet...');
-    const THUMB_INTERVAL = 10; // seconds between thumbnails
-    const THUMB_COLS = 10;
-    const THUMB_ROWS = 10;
-    const THUMB_TILE_WIDTH = 160;
+    const {
+      intervalSec: THUMB_INTERVAL,
+      tileWidth: THUMB_TILE_WIDTH,
+      cols: THUMB_COLS,
+      rows: THUMB_ROWS,
+      extension: THUMB_EXT,
+      avifCpuUsed,
+      avifCrf,
+    } = THUMB_STORYBOARD;
     const videoDurationVal = duration || 0;
 
     if (videoDurationVal > 0) {
-      const spritePattern = path.join(OUTPUT_DIR, 'thumb_sprite_%03d.jpg');
-      const spriteCmd = `ffmpeg -y -nostdin -analyzeduration 100M -probesize 100M -protocol_whitelist file,http,tcp,https,tls -i "${inputSource}" -vf "fps=1/${THUMB_INTERVAL},scale=${THUMB_TILE_WIDTH}:-2,tile=${THUMB_COLS}x${THUMB_ROWS}" -q:v 4 "${spritePattern}"`;
+      if (!hasLibaomAv1Encoder()) {
+        throw new Error(
+          'Thumbnail storyboard requires ffmpeg libaom-av1 for AVIF sprites, but libaom-av1 is not available on this runner',
+        );
+      }
+
+      // image2 + %03d so multi-sheet sequences work; avif muxer alone treats %03d literally.
+      const spritePattern = path.join(OUTPUT_DIR, `thumb_sprite_%03d.${THUMB_EXT}`);
+      const spriteCmd = [
+        'ffmpeg -y -nostdin',
+        '-analyzeduration 100M -probesize 100M',
+        '-protocol_whitelist file,http,tcp,https,tls',
+        `-i "${inputSource}"`,
+        `-vf "fps=1/${THUMB_INTERVAL},scale=${THUMB_TILE_WIDTH}:-2,tile=${THUMB_COLS}x${THUMB_ROWS}"`,
+        '-f image2',
+        '-c:v libaom-av1',
+        `-cpu-used ${avifCpuUsed}`,
+        `-crf ${avifCrf}`,
+        '-still-picture 1',
+        `"${spritePattern}"`,
+      ].join(' ');
       console.log(`Executing thumbnail sprite command: ${spriteCmd}`);
 
       try {
         await execAsync(spriteCmd, { stdio: 'inherit' });
 
+        const spriteRe = storyboardSpriteGlob(THUMB_EXT);
         const spriteFiles = (await fs.promises.readdir(OUTPUT_DIR))
-          .filter(name => /^thumb_sprite_\d+\.jpg$/.test(name))
+          .filter(name => spriteRe.test(name))
           .sort();
 
         if (spriteFiles.length > 0) {
@@ -2927,26 +3030,17 @@ async function main() {
           const tileWidth = Math.round(sheetWidth / THUMB_COLS);
           const tileHeight = Math.round(sheetHeight / THUMB_ROWS);
 
-          const totalThumbs = Math.ceil(videoDurationVal / THUMB_INTERVAL);
-          const tilesPerSheet = THUMB_COLS * THUMB_ROWS;
-
+          // "thumbnails/" prefix (not just the bare filename): @videojs/react resolves
+          // this cue reference relative to the <track src> URL (.../hls/thumbnails.vtt),
+          // and relative resolution drops the last path segment - so a bare filename
+          // would resolve to .../hls/<file>, not .../hls/thumbnails/<file>.
           let vtt = 'WEBVTT\n\n';
-          for (let i = 0; i < totalThumbs; i++) {
-            const start = i * THUMB_INTERVAL;
-            const end = Math.min(start + THUMB_INTERVAL, videoDurationVal);
-            const sheetIdx = Math.floor(i / tilesPerSheet);
-            const localIdx = i % tilesPerSheet;
-            const col = localIdx % THUMB_COLS;
-            const row = Math.floor(localIdx / THUMB_COLS);
-            const sheetName = `thumb_sprite_${String(sheetIdx + 1).padStart(3, '0')}.jpg`;
-            vtt += `${formatTimestamp(start)} --> ${formatTimestamp(end)}\n`;
-            // "thumbnails/" prefix (not just the bare filename): @videojs/react resolves
-            // this cue reference relative to the <track src> URL (.../hls/thumbnails.vtt),
-            // and relative resolution drops the last path segment - so a bare filename
-            // would resolve to .../hls/<file>.jpg, not the .../hls/thumbnails/<file>.jpg
-            // route this same worker's sprite files are actually served from.
-            vtt += `thumbnails/${sheetName}#xywh=${col * tileWidth},${row * tileHeight},${tileWidth},${tileHeight}\n\n`;
-          }
+          vtt += buildStoryboardVttBody(videoDurationVal, tileWidth, tileHeight, {
+            intervalSec: THUMB_INTERVAL,
+            cols: THUMB_COLS,
+            rows: THUMB_ROWS,
+            extension: THUMB_EXT,
+          });
 
           const vttPath = path.join(OUTPUT_DIR, 'thumbnails.vtt');
           await fs.promises.writeFile(vttPath, vtt, 'utf8');
@@ -4013,5 +4107,12 @@ if (require.main === module) {
     normalizeFieldParity,
     generateKeyframeTimeline,
     shouldComputeSegmentTimeline,
+    THUMB_STORYBOARD,
+    countStoryboardThumbs,
+    storyboardTilesPerSheet,
+    storyboardSheetIndexForThumb,
+    storyboardSheetName,
+    buildStoryboardVttBody,
+    storyboardSpriteGlob,
   };
 }

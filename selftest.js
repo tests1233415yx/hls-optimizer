@@ -17,6 +17,13 @@ const {
   normalizeFieldParity,
   generateKeyframeTimeline,
   shouldComputeSegmentTimeline,
+  THUMB_STORYBOARD,
+  countStoryboardThumbs,
+  storyboardTilesPerSheet,
+  storyboardSheetIndexForThumb,
+  storyboardSheetName,
+  buildStoryboardVttBody,
+  storyboardSpriteGlob,
 } = require('./optimize.js');
 
 let passed = 0;
@@ -276,6 +283,50 @@ run('generateKeyframeTimeline: uses scene cuts inside the 3-9s window, else targ
 run('generateKeyframeTimeline: empty scene list falls back to regular targetSec steps', () => {
   const times = generateKeyframeTimeline([], 20, 6, 3, 9);
   assertEqual(times, [6, 12, 18], 'flat 6s grid when no scene cuts');
+});
+
+// ---------------------------------------------------------------------------
+// Thumbnail storyboard (5s / 320 / 10×10 / AVIF)
+// ---------------------------------------------------------------------------
+
+run('THUMB_STORYBOARD constants: 5s interval, 320px tiles, 10x10, avif', () => {
+  assertEqual(THUMB_STORYBOARD.intervalSec, 5, 'intervalSec');
+  assertEqual(THUMB_STORYBOARD.tileWidth, 320, 'tileWidth');
+  assertEqual(THUMB_STORYBOARD.cols, 10, 'cols');
+  assertEqual(THUMB_STORYBOARD.rows, 10, 'rows');
+  assertEqual(THUMB_STORYBOARD.extension, 'avif', 'extension');
+});
+
+run('countStoryboardThumbs: ceil(duration/interval) for ~25 min @ 5s', () => {
+  assertEqual(countStoryboardThumbs(1494.016, 5), 299, '1494.016s / 5s');
+  assertEqual(countStoryboardThumbs(1500, 5), 300, 'exact 25 min');
+  assertEqual(countStoryboardThumbs(0, 5), 0, 'zero duration');
+});
+
+run('storyboard sheet naming and index (10x10 = 100 tiles/sheet)', () => {
+  assertEqual(storyboardTilesPerSheet(10, 10), 100, 'tiles per sheet');
+  assertEqual(storyboardSheetIndexForThumb(0), 0, 'first thumb sheet 0');
+  assertEqual(storyboardSheetIndexForThumb(99), 0, '99 still sheet 0');
+  assertEqual(storyboardSheetIndexForThumb(100), 1, '100 starts sheet 1');
+  assertEqual(storyboardSheetName(0, 'avif'), 'thumb_sprite_001.avif', 'sheet 0 name');
+  assertEqual(storyboardSheetName(2, 'avif'), 'thumb_sprite_003.avif', 'sheet 2 name');
+  assertTrue(storyboardSpriteGlob('avif').test('thumb_sprite_001.avif'), 'glob matches avif');
+  assertFalse(storyboardSpriteGlob('avif').test('thumb_sprite_001.jpg'), 'glob rejects jpg');
+});
+
+run('buildStoryboardVttBody: cues use 5s steps and .avif #xywh URLs', () => {
+  const body = buildStoryboardVttBody(12, 320, 180, {
+    intervalSec: 5,
+    cols: 10,
+    rows: 10,
+    extension: 'avif',
+  });
+  // 12s / 5s → 3 thumbs
+  assertTrue(body.includes('00:00:00.000 --> 00:00:05.000'), 'first cue');
+  assertTrue(body.includes('thumbnails/thumb_sprite_001.avif#xywh=0,0,320,180'), 'first tile avif');
+  assertTrue(body.includes('thumbnails/thumb_sprite_001.avif#xywh=320,0,320,180'), 'second col');
+  assertFalse(body.includes('.jpg'), 'no jpeg references');
+  assertEqual(countStoryboardThumbs(12, 5), 3, 'three thumbs for 12s');
 });
 
 // ---------------------------------------------------------------------------
