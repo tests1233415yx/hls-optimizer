@@ -1514,8 +1514,8 @@ function sampleInterlaceWithIdet(inputSource, startTime, sampleSeconds = 3) {
       args.push('-ss', startTime.toFixed(3));
     }
     args.push(
-      '-analyzeduration', '10M',
-      '-probesize', '10M',
+      '-analyzeduration', '100M',
+      '-probesize', '100M',
       '-protocol_whitelist', 'file,http,tcp,https,tls',
       '-i', inputSource,
       '-t', String(sampleSeconds),
