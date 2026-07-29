@@ -1469,165 +1469,587 @@ function startCachingProxy(partAssets, token) {
   });
 }
 
-// Definitive container field_order values (ffmpeg/ffprobe).
-// progressive → skip deinterlace; tt/bb/tb/bt → deinterlace; anything else → sample with idet.
-function fieldOrderImpliesInterlaced(fieldOrder) {
+// ============================================================================
+// Field-type detection + deinterlace / IVTC (ffmpeg-max for GHA)
+// ----------------------------------------------------------------------------
+// progressive     → no field filter
+// soft_telecine   → pin film CFR (repeat_pict progressive 29.97 container)
+// telecine        → fieldmatch + residual yadif + decimate + film CFR
+// interlaced      → bwdif bob (send_field, deint=all) + double-rate CFR
+// hybrid          → bwdif send_frame deint=all (woven combing / unknown)
+//
+// field_order=progressive never trusted alone.
+// Override: vps.field_strategy / HLS_FIELD_STRATEGY =
+//   auto|off|progressive|soft_telecine|telecine|interlaced|hybrid
+// ============================================================================
+
+const FIELD_STRATEGY_VALUES = new Set([
+  'auto', 'off', 'progressive', 'soft_telecine', 'telecine', 'interlaced', 'hybrid',
+]);
+
+function normalizeFieldStrategy(value) {
+  if (value === undefined || value === null || value === '') return 'auto';
+  const s = String(value).toLowerCase().trim();
+  if (s === 'none' || s === 'skip') return 'off';
+  if (s === 'bwdif') return 'hybrid';
+  if (s === 'ivtc' || s === 'detelecine') return 'telecine';
+  if (s === 'bob' || s === 'deinterlace') return 'interlaced';
+  return FIELD_STRATEGY_VALUES.has(s) ? s : 'auto';
+}
+
+function normalizeFieldParity(value) {
+  if (!value) return 'auto';
+  const p = String(value).toLowerCase().trim();
+  if (p === 'tff' || p === 'bff' || p === 'auto') return p;
+  return 'auto';
+}
+
+function fieldOrderParity(fieldOrder) {
   if (!fieldOrder) return null;
   const fo = String(fieldOrder).toLowerCase().trim();
-  if (fo === 'progressive') return false;
-  if (fo === 'tt' || fo === 'bb' || fo === 'tb' || fo === 'bt') return true;
-  return null; // unknown / not coded / etc.
+  if (fo === 'tt' || fo === 'tb') return 'tff';
+  if (fo === 'bb' || fo === 'bt') return 'bff';
+  return null;
 }
 
-function parseIdetMultiFrameStats(stderr) {
-  // Multi frame detection: TFF:   12 BFF:    0 Progressive:  148 Undetermined:    0
-  const re = /Multi frame detection:\s*TFF:\s*(\d+)\s*BFF:\s*(\d+)\s*Progressive:\s*(\d+)\s*Undetermined:\s*(\d+)/i;
-  const m = re.exec(stderr);
-  if (!m) return null;
-  return {
-    tff: parseInt(m[1], 10),
-    bff: parseInt(m[2], 10),
-    progressive: parseInt(m[3], 10),
-    undetermined: parseInt(m[4], 10),
-  };
+function fieldOrderIsInterlaced(fieldOrder) {
+  return fieldOrderParity(fieldOrder) !== null;
 }
 
-// Only return false (skip bwdif) when progressive clearly dominates.
-// Ambiguous / sparse samples return true so we keep quality-safe deinterlace.
+function idetStatsDetermined(stats) {
+  if (!stats) return 0;
+  return stats.tff + stats.bff + stats.progressive;
+}
+
+function parseIdetStats(stderr) {
+  const multiRe =
+    /Multi[- ]frame detection:\s*TFF:\s*(\d+)\s*BFF:\s*(\d+)\s*Progressive:\s*(\d+)\s*Undetermined:\s*(\d+)/gi;
+  let best = null;
+  let m;
+  while ((m = multiRe.exec(stderr)) !== null) {
+    const stats = {
+      tff: parseInt(m[1], 10),
+      bff: parseInt(m[2], 10),
+      progressive: parseInt(m[3], 10),
+      undetermined: parseInt(m[4], 10),
+    };
+    if (!best || idetStatsDetermined(stats) >= idetStatsDetermined(best)) best = stats;
+  }
+  if (best && idetStatsDetermined(best) > 0) return best;
+
+  const singleRe =
+    /Single[- ]frame detection:\s*TFF:\s*(\d+)\s*BFF:\s*(\d+)\s*Progressive:\s*(\d+)\s*Undetermined:\s*(\d+)/gi;
+  let singleBest = null;
+  while ((m = singleRe.exec(stderr)) !== null) {
+    const stats = {
+      tff: parseInt(m[1], 10),
+      bff: parseInt(m[2], 10),
+      progressive: parseInt(m[3], 10),
+      undetermined: parseInt(m[4], 10),
+    };
+    if (!singleBest || idetStatsDetermined(stats) >= idetStatsDetermined(singleBest)) {
+      singleBest = stats;
+    }
+  }
+  return singleBest || best;
+}
+
+function parityFromIdet(stats) {
+  if (!stats) return 'auto';
+  if (stats.tff > stats.bff * 1.5 && stats.tff >= 8) return 'tff';
+  if (stats.bff > stats.tff * 1.5 && stats.bff >= 8) return 'bff';
+  return 'auto';
+}
+
 function isConfidentlyProgressiveFromIdet(stats) {
   if (!stats) return false;
   const interlaced = stats.tff + stats.bff;
   const progressive = stats.progressive;
   const determined = interlaced + progressive;
-  // Need a usable sample; undetermined-only is not reliable.
   if (determined < 12) return false;
-  // Strong progressive majority: at least 2:1 and progressive is the bulk of determined frames.
   return progressive >= interlaced * 2 && progressive / determined >= 0.75;
 }
 
-// Short idet pass on a downscaled window of this part. Cheap compared to a full encode;
-// only used when field_order is not definitive.
-function sampleInterlaceWithIdet(inputSource, startTime, sampleSeconds = 3) {
-  return new Promise((resolve) => {
-    const args = ['-nostdin'];
-    if (startTime > 0) {
-      args.push('-ss', startTime.toFixed(3));
-    }
-    args.push(
-      '-analyzeduration', '100M',
-      '-probesize', '100M',
-      '-protocol_whitelist', 'file,http,tcp,https,tls',
-      '-i', inputSource,
-      '-t', String(sampleSeconds),
-      '-an',
-      '-vf', 'scale=-2:360,idet',
-      '-f', 'null',
-      '-'
-    );
+function isConfidentlyInterlacedFromIdet(stats) {
+  if (!stats) return false;
+  const interlaced = stats.tff + stats.bff;
+  const progressive = stats.progressive;
+  const determined = interlaced + progressive;
+  if (determined < 12) return false;
+  return interlaced >= progressive * 2 && interlaced / determined >= 0.6;
+}
 
-    console.log(`Sampling interlace with idet: ffmpeg ${args.join(' ')}`);
-    const child = spawn('ffmpeg', args);
+function isTelecineLikeIdet(stats) {
+  if (!stats) return false;
+  const interlaced = stats.tff + stats.bff;
+  const progressive = stats.progressive;
+  const determined = interlaced + progressive;
+  if (determined < 20) return false;
+  const progRatio = progressive / determined;
+  const intRatio = interlaced / determined;
+  return progRatio >= 0.45 && progRatio <= 0.9 && intRatio >= 0.1 && intRatio <= 0.5;
+}
+
+function fpsNear(fps, target, tol = 0.08) {
+  return !!fps && isFinite(fps) && Math.abs(fps - target) <= tol;
+}
+
+function isFilmFps(fps) {
+  return fpsNear(fps, 23.976, 0.12) || fpsNear(fps, 24, 0.12);
+}
+
+function isNtsc30Family(fps) {
+  return fpsNear(fps, 29.97, 0.15) || fpsNear(fps, 30, 0.15);
+}
+
+function isNtsc60Family(fps) {
+  return fpsNear(fps, 59.94, 0.2) || fpsNear(fps, 60, 0.2);
+}
+
+function isPal25Family(fps) {
+  return fpsNear(fps, 25, 0.15);
+}
+
+function isPal50Family(fps) {
+  return fpsNear(fps, 50, 0.2);
+}
+
+/** Map numeric fps to a clean ffmpeg rate string. */
+function fpsToRateString(fps) {
+  if (!fps || !isFinite(fps)) return null;
+  if (fpsNear(fps, 23.976, 0.12)) return '24000/1001';
+  if (fpsNear(fps, 24, 0.08)) return '24';
+  if (fpsNear(fps, 25, 0.08)) return '25';
+  if (fpsNear(fps, 29.97, 0.12)) return '30000/1001';
+  if (fpsNear(fps, 30, 0.08)) return '30';
+  if (fpsNear(fps, 50, 0.12)) return '50';
+  if (fpsNear(fps, 59.94, 0.2)) return '60000/1001';
+  if (fpsNear(fps, 60, 0.12)) return '60';
+  // Keep modest precision for odd rates (cinema 21.0 etc. rare in this pipeline).
+  return (Math.round(fps * 1000) / 1000).toString();
+}
+
+function bobOutRate(sourceFps) {
+  if (isPal25Family(sourceFps) || isPal50Family(sourceFps)) return '50';
+  if (isNtsc30Family(sourceFps) || isNtsc60Family(sourceFps)) return '60000/1001';
+  if (sourceFps && isFinite(sourceFps)) return fpsToRateString(sourceFps * 2);
+  return '60000/1001';
+}
+
+function parseLastFrameCount(stderr) {
+  let last = null;
+  const re = /frame=\s*(\d+)/g;
+  let m;
+  while ((m = re.exec(stderr)) !== null) last = parseInt(m[1], 10);
+  return last;
+}
+
+function runFfmpegStderr(args) {
+  return new Promise((resolve) => {
+    console.log(`ffmpeg ${args.join(' ')}`);
+    const child = spawn('ffmpeg', args, { stdio: ['ignore', 'ignore', 'pipe'] });
     let stderr = '';
-    child.stderr.on('data', (chunk) => {
-      stderr += chunk.toString();
-    });
-    child.on('close', () => {
-      const stats = parseIdetMultiFrameStats(stderr);
-      if (stats) {
-        console.log(
-          `idet multi-frame: TFF=${stats.tff} BFF=${stats.bff} Progressive=${stats.progressive} Undetermined=${stats.undetermined}`
-        );
-      } else {
-        console.warn('idet: could not parse Multi frame detection stats from ffmpeg stderr');
-      }
-      resolve(stats);
-    });
+    child.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
+    child.on('close', (code) => resolve({ code, stderr }));
     child.on('error', (err) => {
-      console.warn('Error during idet interlace sample:', err.message || err);
-      resolve(null);
+      console.warn('ffmpeg spawn error:', err.message || err);
+      resolve({ code: -1, stderr, error: err });
     });
   });
 }
 
-/**
- * Decide whether to run bwdif on compressed encodes.
- * Only skip when we are confident the source is progressive (field_order or strong idet).
- * On any uncertainty, return true (keep bwdif) — false negative causes combing artifacts.
- */
-async function shouldApplyBwdif(inputSource, videoStream, startTime) {
-  const fieldOrder = videoStream && videoStream.field_order;
-  const fromMeta = fieldOrderImpliesInterlaced(fieldOrder);
-  if (fromMeta === true) {
-    console.log(`Deinterlace: field_order=${fieldOrder} → interlaced, applying bwdif`);
-    return true;
-  }
+// Output-side -ss after -i: input -ss on the range proxy produced empty idet windows.
+function buildFieldAnalysisArgs(inputSource, seekSeconds, sampleSeconds, vf) {
+  const args = [
+    '-nostdin', '-hide_banner',
+    '-analyzeduration', '100M', '-probesize', '100M',
+    '-protocol_whitelist', 'file,http,tcp,https,tls',
+    '-i', inputSource,
+  ];
+  if (seekSeconds > 0) args.push('-ss', seekSeconds.toFixed(3));
+  args.push('-t', String(sampleSeconds), '-an', '-sn', '-dn', '-map', '0:v:0');
+  if (vf) args.push('-vf', vf);
+  args.push('-f', 'null', '-');
+  return args;
+}
 
-  // Note: field_order=progressive is NOT trusted on its own — old/rewrapped rips
-  // (esp. old anime/TV sources) routinely mislabel telecined or interlaced content
-  // as progressive in the container. Always confirm with an idet sample instead of
-  // skipping bwdif outright on metadata alone.
-  console.log(
-    `Deinterlace: field_order=${fieldOrder || 'missing'} not trusted alone; sampling with idet...`
+async function runIdetSample(inputSource, seekSeconds, sampleSeconds) {
+  const { code, stderr } = await runFfmpegStderr(
+    buildFieldAnalysisArgs(inputSource, seekSeconds, sampleSeconds, 'idet'),
   );
-  const stats = await sampleInterlaceWithIdet(inputSource, startTime, 3);
-  if (isConfidentlyProgressiveFromIdet(stats)) {
-    console.log('Deinterlace: idet confident progressive → skipping bwdif');
-    return false;
+  const stats = parseIdetStats(stderr);
+  if (stats) {
+    console.log(
+      `idet @${seekSeconds.toFixed(1)}s: TFF=${stats.tff} BFF=${stats.bff} Progressive=${stats.progressive} Undetermined=${stats.undetermined} (exit=${code})`,
+    );
+  } else {
+    console.warn(`idet @${seekSeconds.toFixed(1)}s: no stats (exit=${code})`);
+    const tail = stderr.trim().split(/\r?\n/).slice(-6).join('\n');
+    if (tail) console.warn(`idet stderr tail:\n${tail}`);
   }
-  console.log('Deinterlace: idet inconclusive or interlaced → applying bwdif (quality-safe default)');
-  return true;
+  return stats;
 }
 
-function buildScaleVf(targetHeight, applyBwdif) {
-  const scale = `scale='trunc(oh*a/2)*2':'trunc(min(${targetHeight},ih)/2)*2'`;
-  return applyBwdif ? `bwdif,${scale}` : scale;
-}
+async function sampleInterlaceWithIdet(inputSource, startTime, sampleSeconds = 10) {
+  // Dense windows: logos/black at 0, action later, mid-part, deep part.
+  const offsets = [0, 12, 45, 120, 240];
+  let merged = { tff: 0, bff: 0, progressive: 0, undetermined: 0 };
+  let any = false;
+  let decisiveHits = 0;
 
-function detectSceneCuts(inputSource, startTime, endTime) {
-  return new Promise((resolve) => {
-    const args = ['-nostdin'];
-    if (startTime > 0) {
-      args.push('-ss', startTime.toFixed(3));
+  for (const rel of offsets) {
+    const seek = Math.max(0, startTime + rel);
+    const stats = await runIdetSample(inputSource, seek, sampleSeconds);
+    if (!stats || idetStatsDetermined(stats) + (stats.undetermined || 0) === 0) continue;
+    any = true;
+    merged.tff += stats.tff;
+    merged.bff += stats.bff;
+    merged.progressive += stats.progressive;
+    merged.undetermined += stats.undetermined;
+
+    const decisive =
+      isConfidentlyProgressiveFromIdet(stats) ||
+      isConfidentlyInterlacedFromIdet(stats) ||
+      isTelecineLikeIdet(stats);
+    if (decisive) decisiveHits += 1;
+
+    // Need 2 agreeing decisive windows OR a large classified pool.
+    if (decisiveHits >= 2 || idetStatsDetermined(merged) >= 90) {
+      console.log(
+        `idet stop @+${rel}s hits=${decisiveHits} → TFF=${merged.tff} BFF=${merged.bff} Progressive=${merged.progressive} Undetermined=${merged.undetermined}`,
+      );
+      return merged;
     }
+  }
+
+  if (!any) return null;
+  console.log(
+    `idet aggregated: TFF=${merged.tff} BFF=${merged.bff} Progressive=${merged.progressive} Undetermined=${merged.undetermined}`,
+  );
+  return merged;
+}
+
+/**
+ * Confirm hard 3:2 pulldown: IVTC frame count ≈ 0.8 × source over the same wall time.
+ * Two windows must agree when both are conclusive (reduces logo/credits false positives).
+ */
+async function probeTelecineWindow(inputSource, seek, parity, sampleSeconds = 8) {
+  const order = parity === 'bff' ? 'bff' : parity === 'tff' ? 'tff' : 'auto';
+  const raw = await runFfmpegStderr(
+    buildFieldAnalysisArgs(inputSource, seek, sampleSeconds, null),
+  );
+  const rawFrames = parseLastFrameCount(raw.stderr);
+  const ivtc = await runFfmpegStderr(
+    buildFieldAnalysisArgs(
+      inputSource,
+      seek,
+      sampleSeconds,
+      `fieldmatch=order=${order}:combmatch=full,decimate=cycle=5`,
+    ),
+  );
+  const ivtcFrames = parseLastFrameCount(ivtc.stderr);
+  if (!rawFrames || !ivtcFrames || rawFrames < 40) {
+    return { ok: false, ratio: null, rawFrames, ivtcFrames };
+  }
+  const ratio = ivtcFrames / rawFrames;
+  const isTc = ratio >= 0.72 && ratio <= 0.88;
+  console.log(
+    `Telecine probe @${seek.toFixed(1)}s: raw=${rawFrames} ivtc=${ivtcFrames} ratio=${ratio.toFixed(3)} → ${isTc ? 'TELECINE' : 'no'}`,
+  );
+  return { ok: isTc, ratio, rawFrames, ivtcFrames };
+}
+
+async function probeTelecine(inputSource, startTime, parity) {
+  const seeks = [Math.max(0, startTime + 20), Math.max(0, startTime + 90)];
+  const results = [];
+  for (const seek of seeks) {
+    results.push(await probeTelecineWindow(inputSource, seek, parity, 8));
+  }
+  const conclusive = results.filter((r) => r.ratio !== null);
+  if (conclusive.length === 0) return false;
+  const yes = conclusive.filter((r) => r.ok).length;
+  // One strong yes is enough if only one window worked; two windows need majority.
+  if (conclusive.length === 1) return yes === 1;
+  return yes >= Math.ceil(conclusive.length / 2);
+}
+
+function buildBwdifFilter(mode, parity) {
+  const p = parity === 'tff' || parity === 'bff' ? parity : 'auto';
+  const m = mode === 'send_field' ? 'send_field' : 'send_frame';
+  return `bwdif=mode=${m}:parity=${p}:deint=all`;
+}
+
+function buildIvtcFilter(parity) {
+  const order = parity === 'bff' ? 'bff' : parity === 'tff' ? 'tff' : 'auto';
+  const yParity = order === 'auto' ? 'auto' : order;
+  return `fieldmatch=order=${order}:combmatch=full,yadif=mode=send_frame:parity=${yParity}:deint=interlaced,decimate=cycle=5`;
+}
+
+function makeFieldPlan(strategy, parity, fieldFilter, outFps, reason) {
+  return {
+    strategy,
+    parity: parity || 'auto',
+    fieldFilter: fieldFilter || null,
+    outFps: outFps || null,
+    reason: reason || strategy,
+  };
+}
+
+function planFromForcedStrategy(forced, parity, sourceFps) {
+  switch (forced) {
+    case 'off':
+    case 'progressive':
+      return makeFieldPlan('progressive', parity, null, null, `forced:${forced}`);
+    case 'soft_telecine':
+      return makeFieldPlan('soft_telecine', parity, null, '24000/1001', 'forced:soft_telecine');
+    case 'telecine':
+      return makeFieldPlan('telecine', parity, buildIvtcFilter(parity), '24000/1001', 'forced:telecine');
+    case 'interlaced':
+      return makeFieldPlan(
+        'interlaced',
+        parity,
+        buildBwdifFilter('send_field', parity),
+        bobOutRate(sourceFps),
+        'forced:interlaced',
+      );
+    case 'hybrid':
+      return makeFieldPlan(
+        'hybrid',
+        parity,
+        buildBwdifFilter('send_frame', parity),
+        fpsToRateString(sourceFps),
+        'forced:hybrid',
+      );
+    default:
+      return null;
+  }
+}
+
+/**
+ * @returns {{
+ *   strategy: string,
+ *   parity: string,
+ *   fieldFilter: string|null,
+ *   outFps: string|null,
+ *   reason: string,
+ * }}
+ */
+async function detectFieldStrategy(inputSource, videoStream, startTime, options = {}) {
+  const fieldOrder = videoStream && videoStream.field_order;
+  const rFps = videoStream && videoStream.r_frame_rate
+    ? parseFrameRate(videoStream.r_frame_rate)
+    : null;
+  const avgFps = videoStream && videoStream.avg_frame_rate
+    ? parseFrameRate(videoStream.avg_frame_rate)
+    : null;
+  const sourceFps = avgFps || rFps;
+
+  let parity = normalizeFieldParity(options.forceParity);
+  if (parity === 'auto') {
+    parity = fieldOrderParity(fieldOrder) || 'auto';
+  }
+
+  const forced = normalizeFieldStrategy(options.forceStrategy);
+  if (forced !== 'auto') {
+    const plan = planFromForcedStrategy(forced, parity, sourceFps);
+    console.log(`Field strategy FORCED → ${JSON.stringify(plan)}`);
+    return plan;
+  }
+
+  // 1) Container says true interlaced.
+  if (fieldOrderIsInterlaced(fieldOrder)) {
+    if (parity === 'auto') parity = fieldOrderParity(fieldOrder) || 'auto';
+    const plan = makeFieldPlan(
+      'interlaced',
+      parity,
+      buildBwdifFilter('send_field', parity),
+      bobOutRate(sourceFps),
+      `field_order=${fieldOrder}`,
+    );
+    console.log(`Field strategy: ${JSON.stringify(plan)}`);
+    return plan;
+  }
+
+  // 2) Soft telecine: r≈29.97 container rate, avg≈23.976 film delivery, progressive samples.
+  //    Progressive frames with pulldown flags — do NOT hard-IVTC or bwdif.
+  const softTelecineMeta =
+    isNtsc30Family(rFps) && isFilmFps(avgFps) && Math.abs((rFps || 0) - (avgFps || 0)) > 1.0;
+
+  console.log(
+    `Field strategy probe: field_order=${fieldOrder || 'missing'} r=${rFps || '?'} avg=${avgFps || '?'} softMeta=${softTelecineMeta}`,
+  );
+
+  const stats = await sampleInterlaceWithIdet(inputSource, startTime, 10);
+  if (stats) {
+    const idetParity = parityFromIdet(stats);
+    if (parity === 'auto' && idetParity !== 'auto') parity = idetParity;
+  }
+
+  // Already bobbed / high-frame progressive (common 4K remasters) → leave alone.
+  if (
+    (isNtsc60Family(rFps) || isPal50Family(rFps) || isNtsc60Family(avgFps) || isPal50Family(avgFps)) &&
+    isConfidentlyProgressiveFromIdet(stats)
+  ) {
+    const plan = makeFieldPlan('progressive', parity, null, null, 'high-fps progressive (skip)');
+    console.log(`Field strategy: ${JSON.stringify(plan)}`);
+    return plan;
+  }
+
+  if (softTelecineMeta && (isConfidentlyProgressiveFromIdet(stats) || !stats)) {
+    const plan = makeFieldPlan(
+      'soft_telecine',
+      parity,
+      null,
+      '24000/1001',
+      'r≈29.97 avg≈23.976 progressive',
+    );
+    console.log(`Field strategy: ${JSON.stringify(plan)}`);
+    return plan;
+  }
+
+  // True film progressive masters.
+  if (isFilmFps(sourceFps) && isConfidentlyProgressiveFromIdet(stats)) {
+    const plan = makeFieldPlan('progressive', parity, null, null, 'film progressive');
+    console.log(`Field strategy: ${JSON.stringify(plan)}`);
+    return plan;
+  }
+
+  // PAL 25 progressive.
+  if (isPal25Family(sourceFps) && isConfidentlyProgressiveFromIdet(stats)) {
+    const plan = makeFieldPlan('progressive', parity, null, null, 'PAL progressive');
+    console.log(`Field strategy: ${JSON.stringify(plan)}`);
+    return plan;
+  }
+
+  // Hard telecine (NTSC 29.97 woven 3:2) — prefer IVTC over bwdif.
+  const telecineCandidate =
+    isNtsc30Family(rFps || sourceFps) &&
+    !isConfidentlyInterlacedFromIdet(stats) &&
+    (isTelecineLikeIdet(stats) || !isConfidentlyProgressiveFromIdet(stats) || !stats);
+
+  if (telecineCandidate) {
+    try {
+      if (await probeTelecine(inputSource, startTime, parity)) {
+        const plan = makeFieldPlan(
+          'telecine',
+          parity,
+          buildIvtcFilter(parity),
+          '24000/1001',
+          'hard 3:2 pulldown',
+        );
+        console.log(`Field strategy: ${JSON.stringify(plan)}`);
+        return plan;
+      }
+    } catch (e) {
+      console.warn('Telecine probe failed:', e.message || e);
+    }
+  }
+
+  if (isConfidentlyProgressiveFromIdet(stats)) {
+    const plan = makeFieldPlan('progressive', parity, null, null, 'idet progressive');
+    console.log(`Field strategy: ${JSON.stringify(plan)}`);
+    return plan;
+  }
+
+  // True interlaced (NTSC 29.97i / PAL 25i) → bob.
+  if (isConfidentlyInterlacedFromIdet(stats)) {
+    const plan = makeFieldPlan(
+      'interlaced',
+      parity,
+      buildBwdifFilter('send_field', parity),
+      bobOutRate(sourceFps),
+      'idet interlaced',
+    );
+    console.log(`Field strategy: ${JSON.stringify(plan)}`);
+    return plan;
+  }
+
+  // Fail-open hybrid: progressive-tagged combing (old anime rips etc.).
+  const plan = makeFieldPlan(
+    'hybrid',
+    parity,
+    buildBwdifFilter('send_frame', parity),
+    fpsToRateString(sourceFps),
+    stats ? 'idet inconclusive' : 'idet empty/fail-open',
+  );
+  console.log(`Field strategy: ${JSON.stringify(plan)}`);
+  return plan;
+}
+
+/** field restore → optional CFR pin → scale. */
+function buildScaleVf(targetHeight, fieldPlan) {
+  const scale = `scale='trunc(oh*a/2)*2':'trunc(min(${targetHeight},ih)/2)*2'`;
+  if (!fieldPlan || typeof fieldPlan !== 'object') return scale;
+  const parts = [];
+  if (fieldPlan.fieldFilter) parts.push(fieldPlan.fieldFilter);
+  if (fieldPlan.outFps) parts.push(`fps=${fieldPlan.outFps}`);
+  parts.push(scale);
+  return parts.join(',');
+}
+
+function fieldPlanOutputFpsNumber(fieldPlan, fallbackFps) {
+  if (fieldPlan && fieldPlan.outFps) {
+    const s = String(fieldPlan.outFps);
+    if (s.includes('/')) {
+      const [a, b] = s.split('/');
+      const n = parseFloat(a) / parseFloat(b);
+      if (isFinite(n) && n > 0) return n;
+    } else {
+      const n = parseFloat(s);
+      if (isFinite(n) && n > 0) return n;
+    }
+  }
+  return fallbackFps && isFinite(fallbackFps) ? fallbackFps : 30;
+}
+
+/**
+ * Scene cuts on the SAME field+fps chain as encode so -force_key_frames
+ * timestamps match the post-filter clock (critical after IVTC / bob).
+ */
+function detectSceneCuts(inputSource, startTime, endTime, fieldPlan) {
+  return new Promise((resolve) => {
+    // Match encode seek style: input -ss before -i so output PTS start near 0 and
+    // -force_key_frames times stay part-relative. Field+fps filters still run so cuts
+    // land on the post-restore clock (IVTC/bob), not the raw source cadence.
+    const args = ['-nostdin', '-hide_banner'];
+    if (startTime > 0) args.push('-ss', startTime.toFixed(3));
     args.push(
-      '-analyzeduration', '100M',
-      '-probesize', '100M',
+      '-analyzeduration', '100M', '-probesize', '100M',
       '-protocol_whitelist', 'file,http,tcp,https,tls',
       '-i', inputSource,
     );
-    // Output -t rather than input -to; see the video job for why. The scene-cut timestamps
-    // this returns must stay on the same part-relative clock as the encode's -force_key_frames.
     if (endTime !== null) {
       args.push('-t', Math.max(0, endTime - startTime).toFixed(3));
     }
-    args.push(
-      '-an',
-      '-vf', "scale=-2:240,select='gt(scene,0.4)',showinfo",
-      '-f', 'null',
-      '-'
-    );
 
-    console.log(`Running scene-cut detection: ffmpeg ${args.join(' ')}`);
-    const child = spawn('ffmpeg', args);
+    const vfParts = [];
+    if (fieldPlan && fieldPlan.fieldFilter) vfParts.push(fieldPlan.fieldFilter);
+    if (fieldPlan && fieldPlan.outFps) vfParts.push(`fps=${fieldPlan.outFps}`);
+    vfParts.push('scale=-2:240');
+    vfParts.push("select='gt(scene,0.4)'");
+    vfParts.push('showinfo');
+
+    args.push('-an', '-sn', '-dn', '-map', '0:v:0', '-vf', vfParts.join(','), '-f', 'null', '-');
+
+    console.log(`Running scene-cut detection (post-field clock): ffmpeg ${args.join(' ')}`);
+    const child = spawn('ffmpeg', args, { stdio: ['ignore', 'ignore', 'pipe'] });
     let stderr = '';
-    child.stderr.on('data', (chunk) => {
-      stderr += chunk.toString();
-    });
+    child.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
 
-    child.on('close', (code) => {
+    child.on('close', () => {
       const timestamps = [];
-      const lines = stderr.split(/\r?\n/);
       const regex = /Parsed_showinfo_.*pts_time:([0-9.]+)/;
-      for (const line of lines) {
+      for (const line of stderr.split(/\r?\n/)) {
         const match = regex.exec(line);
         if (match) {
-          const t = parseFloat(match[1]);
-          if (!isNaN(t)) {
-            timestamps.push(t);
-          }
+          let t = parseFloat(match[1]);
+          if (isNaN(t)) continue;
+          // If PTS stayed on the absolute input timeline, fold back to part-local.
+          if (startTime > 0 && t >= startTime - 0.001) t = Math.max(0, t - startTime);
+          timestamps.push(t);
         }
       }
-      console.log(`Detected ${timestamps.length} scene cuts.`);
+      console.log(`Detected ${timestamps.length} scene cuts (post-field).`);
       resolve(timestamps);
     });
 
@@ -1882,7 +2304,7 @@ async function main() {
 
   // 5. Probe video stream properties
   console.log('Probing video stream properties...');
-  const probeCmd = `ffprobe -v error -analyzeduration 100M -probesize 100M -show_entries "format=duration,size,bit_rate:stream=index,codec_type,codec_name,width,height,channels,r_frame_rate,bit_rate,field_order:stream_tags" -of json -protocol_whitelist file,http,tcp,https,tls "${inputSource}"`;
+  const probeCmd = `ffprobe -v error -analyzeduration 100M -probesize 100M -show_entries "format=duration,size,bit_rate:stream=index,codec_type,codec_name,width,height,channels,r_frame_rate,avg_frame_rate,bit_rate,field_order:stream_tags" -of json -protocol_whitelist file,http,tcp,https,tls "${inputSource}"`;
   const probeData = JSON.parse(await execAsync(probeCmd, { maxBuffer: 100 * 1024 * 1024 }));
 
   const videoStream = probeData.streams.find(s => s.codec_type === 'video');
@@ -2384,20 +2806,44 @@ async function main() {
 
 
   let forcedKeyframeString = null;
-  // Default true: quality-safe if detection is skipped (audio/subs/original) or fails open.
-  let applyBwdif = true;
+  // Default hybrid: quality-safe if detection skipped (audio/subs/original) or fails open.
+  let fieldPlan = makeFieldPlan(
+    'hybrid',
+    'auto',
+    buildBwdifFilter('send_frame', 'auto'),
+    null,
+    'default-before-detect',
+  );
+
+  const forceStrategy = normalizeFieldStrategy(
+    (vps && vps.field_strategy) || process.env.HLS_FIELD_STRATEGY || 'auto',
+  );
+  const forceParity = normalizeFieldParity(
+    (vps && vps.field_parity) || process.env.HLS_FIELD_PARITY || 'auto',
+  );
+
   if (kind !== 'original' && !isAudioJob && !isSubtitlesJob) {
     try {
-      applyBwdif = await shouldApplyBwdif(inputSource, videoStream, startTime);
+      fieldPlan = await detectFieldStrategy(inputSource, videoStream, startTime, {
+        forceStrategy,
+        forceParity,
+      });
     } catch (e) {
-      console.warn('Interlace detection failed, keeping bwdif:', e.message || e);
-      applyBwdif = true;
+      console.warn('Field detection failed, keeping hybrid bwdif:', e.message || e);
+      fieldPlan = makeFieldPlan(
+        'hybrid',
+        forceParity === 'auto' ? 'auto' : forceParity,
+        buildBwdifFilter('send_frame', forceParity),
+        null,
+        'detect-error-fail-open',
+      );
     }
+    console.log(`FIELD_PLAN_JSON=${JSON.stringify(fieldPlan)}`);
 
-    console.log('Pre-analysis: Detecting scene cuts for aligned keyframe placement...');
+    console.log('Pre-analysis: scene cuts on post-field clock for keyframe alignment...');
     try {
       const chunkDuration = (endTime !== null ? endTime : duration) - startTime;
-      const sceneCuts = await detectSceneCuts(inputSource, startTime, endTime);
+      const sceneCuts = await detectSceneCuts(inputSource, startTime, endTime, fieldPlan);
       const forcedTimestamps = generateKeyframeTimeline(sceneCuts, chunkDuration, 6, 3, 9);
       if (forcedTimestamps.length > 0) {
         forcedKeyframeString = forcedTimestamps.map(t => t.toFixed(3)).join(',');
@@ -2408,6 +2854,8 @@ async function main() {
     } catch (e) {
       console.warn('Pre-analysis failed:', e);
     }
+  } else {
+    fieldPlan = makeFieldPlan('progressive', 'auto', null, null, 'non-video-job');
   }
   let manifestsUploaded = false;
 
@@ -2526,8 +2974,25 @@ async function main() {
       );
       console.log(`Dynamic params adjusted for ${codec}: CRF=${dynamicParams.crf}, Preset=${dynamicParams.preset}, Maxrate=${dynamicParams.maxrate || 'N/A'}, Bufsize=${dynamicParams.bufsize || 'N/A'}`);
 
-      const vfChain = buildScaleVf(tHeight, applyBwdif);
-      console.log(`Video filter chain for ${codec}: ${vfChain}`);
+      const vfChain = buildScaleVf(tHeight, fieldPlan);
+      console.log(`Video filter chain for ${codec} [${fieldPlan.strategy}]: ${vfChain}`);
+
+      // Output CFR after field restore so HLS timestamps stay stable (IVTC/bob).
+      if (fieldPlan.outFps) {
+        ffmpegArgs.push('-r', String(fieldPlan.outFps));
+      }
+
+      let sourceFpsNum = 30;
+      try {
+        if (videoStream && videoStream.avg_frame_rate) {
+          sourceFpsNum = parseFrameRate(videoStream.avg_frame_rate);
+        } else if (videoStream && videoStream.r_frame_rate) {
+          sourceFpsNum = parseFrameRate(videoStream.r_frame_rate);
+        }
+      } catch (e) {
+        console.warn('Failed parsing frame rate:', e);
+      }
+      const outFpsNum = fieldPlanOutputFpsNumber(fieldPlan, sourceFpsNum);
 
       if (codec === 'h264') {
         ffmpegArgs.push(
@@ -2549,15 +3014,7 @@ async function main() {
           '-flags', '+cgop'
         );
       } else if (codec === 'av1') {
-        let fps = 30; // default fallback
-        try {
-          if (videoStream && videoStream.r_frame_rate) {
-            fps = parseFrameRate(videoStream.r_frame_rate);
-          }
-        } catch (e) {
-          console.warn('Failed parsing r_frame_rate:', e);
-        }
-        const gop = Math.round(fps * 6);
+        const gop = Math.max(1, Math.round(outFpsNum * 6));
 
         ffmpegArgs.push(
           '-c:v', 'libsvtav1',
