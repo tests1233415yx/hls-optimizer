@@ -107,6 +107,48 @@ function checkSvtAv1() {
   }
 }
 
+// Source bit depth from ffprobe: pix_fmt name is authoritative (yuv420p10le etc.),
+// bits_per_raw_sample is the fallback some containers/codecs only expose that way.
+function getSourceBitDepth(videoStream) {
+  if (!videoStream) return 8;
+  const pixFmt = String(videoStream.pix_fmt || '').toLowerCase();
+  const pixFmtMatch = pixFmt.match(/(\d+)(le|be)?$/);
+  if (pixFmtMatch) {
+    const depth = parseInt(pixFmtMatch[1], 10);
+    if (!isNaN(depth) && depth >= 8) return depth;
+  }
+  const raw = parseInt(videoStream.bits_per_raw_sample, 10);
+  if (!isNaN(raw) && raw >= 8) return raw;
+  return 8;
+}
+
+let _x264TenBitSupport = null;
+// Most distro/official ffmpeg builds link libx264 compiled 8-bit-only (High profile caps
+// at yuv420p). 10-bit needs a High10-capable libx264, which not every build ships — check
+// the actual encoder's supported pixel formats rather than assuming.
+function checkX264TenBitSupport() {
+  if (_x264TenBitSupport !== null) return _x264TenBitSupport;
+  try {
+    const out = execSync('ffmpeg -h encoder=libx264 2>&1', { encoding: 'utf8' });
+    _x264TenBitSupport = /yuv420p10le/i.test(out);
+  } catch (e) {
+    _x264TenBitSupport = false;
+  }
+  return _x264TenBitSupport;
+}
+
+let _av1TenBitSupport = null;
+function checkAv1TenBitSupport() {
+  if (_av1TenBitSupport !== null) return _av1TenBitSupport;
+  try {
+    const out = execSync('ffmpeg -h encoder=libsvtav1 2>&1', { encoding: 'utf8' });
+    _av1TenBitSupport = /yuv420p10le/i.test(out);
+  } catch (e) {
+    _av1TenBitSupport = false;
+  }
+  return _av1TenBitSupport;
+}
+
 function adjustVideoParams(label, codec, origBitrateKbps, origHeight, duration, basePreset, baseCrf) {
   let targetHeight = 1080;
   const labelMatch = (label || '').match(/(\d+)p/);
@@ -2371,7 +2413,7 @@ async function main() {
 
   // 5. Probe video stream properties
   console.log('Probing video stream properties...');
-  const probeCmd = `ffprobe -v error -analyzeduration 100M -probesize 100M -show_entries "format=duration,size,bit_rate:stream=index,codec_type,codec_name,width,height,channels,r_frame_rate,avg_frame_rate,bit_rate,field_order:stream_tags" -of json -protocol_whitelist file,http,tcp,https,tls "${inputSource}"`;
+  const probeCmd = `ffprobe -v error -analyzeduration 100M -probesize 100M -show_entries "format=duration,size,bit_rate:stream=index,codec_type,codec_name,width,height,channels,r_frame_rate,avg_frame_rate,bit_rate,field_order,pix_fmt,bits_per_raw_sample,profile:stream_tags" -of json -protocol_whitelist file,http,tcp,https,tls "${inputSource}"`;
   const probeData = JSON.parse(await execAsync(probeCmd, { maxBuffer: 100 * 1024 * 1024 }));
 
   const videoStream = probeData.streams.find(s => s.codec_type === 'video');
@@ -3062,7 +3104,20 @@ async function main() {
       }
       const outFpsNum = fieldPlanOutputFpsNumber(fieldPlan, sourceFpsNum);
 
+      const sourceBitDepth = getSourceBitDepth(videoStream);
+      const wantsHighBitDepth = sourceBitDepth >= 10;
+
       if (codec === 'h264') {
+        let outputPixFmt = 'yuv420p';
+        let outputProfile = hls_profile;
+        if (wantsHighBitDepth && checkX264TenBitSupport()) {
+          outputPixFmt = 'yuv420p10le';
+          outputProfile = 'high10'; // High/Main profiles cap at 8-bit; 10-bit needs High10.
+          console.log(`Source is ${sourceBitDepth}-bit, libx264 supports 10-bit → encoding yuv420p10le/high10`);
+        } else if (wantsHighBitDepth) {
+          console.log(`Source is ${sourceBitDepth}-bit, but this libx264 build lacks 10-bit support → falling back to 8-bit yuv420p`);
+        }
+
         ffmpegArgs.push(
           '-c:v', 'libx264',
           '-preset', dynamicParams.preset,
@@ -3072,10 +3127,10 @@ async function main() {
         const activeBufsize = dynamicParams.bufsize || hls_bufsize;
         if (activeMaxrate) ffmpegArgs.push('-maxrate', activeMaxrate);
         if (activeBufsize) ffmpegArgs.push('-bufsize', activeBufsize);
-        if (hls_profile) ffmpegArgs.push('-profile:v', hls_profile);
+        if (outputProfile) ffmpegArgs.push('-profile:v', outputProfile);
         if (hls_level) ffmpegArgs.push('-level', hls_level);
         ffmpegArgs.push(
-          '-pix_fmt', 'yuv420p',
+          '-pix_fmt', outputPixFmt,
           '-vf', `"${vfChain}"`,
           '-force_key_frames', forcedKeyframeString ? `"${forcedKeyframeString}"` : '"expr:gte(t,n_forced*6)"',
           '-sc_threshold', '0',
@@ -3084,12 +3139,20 @@ async function main() {
       } else if (codec === 'av1') {
         const gop = Math.max(1, Math.round(outFpsNum * 6));
 
+        let av1PixFmt = 'yuv420p';
+        if (wantsHighBitDepth && checkAv1TenBitSupport()) {
+          av1PixFmt = 'yuv420p10le';
+          console.log(`Source is ${sourceBitDepth}-bit, libsvtav1 supports 10-bit → encoding yuv420p10le`);
+        } else if (wantsHighBitDepth) {
+          console.log(`Source is ${sourceBitDepth}-bit, but this libsvtav1 build lacks 10-bit pixel format → falling back to 8-bit yuv420p`);
+        }
+
         ffmpegArgs.push(
           '-c:v', 'libsvtav1',
           '-preset', dynamicParams.preset,
           '-crf', dynamicParams.crf,
           '-svtav1-params', forcedKeyframeString ? 'tune=0:scd=0' : 'tune=0',
-          '-pix_fmt', 'yuv420p',
+          '-pix_fmt', av1PixFmt,
           '-g', String(gop)
         );
         if (dynamicParams.maxrate) {

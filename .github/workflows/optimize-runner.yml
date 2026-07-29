@@ -76,6 +76,7 @@ jobs:
             [ -n "$REMOTE_VERSION" ] && echo "$REMOTE_VERSION" > "$STAMP"
             ffmpeg -version | head -1
             ffmpeg -buildconf | grep svtav1 || (echo "ERROR: libsvtav1 not compiled into this ffmpeg build" && exit 1)
+            ffmpeg -h encoder=libx264 2>&1 | grep -q yuv420p10le || echo "WARNING: libx264 in this ffmpeg build lacks 10-bit (yuv420p10le) support — 10-bit sources will fall back to 8-bit encoding"
           fi
       - name: Configure work directory
         run: |
