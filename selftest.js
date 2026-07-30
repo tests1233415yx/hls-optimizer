@@ -33,6 +33,7 @@ const {
   mergeIdetWindowStats,
   mapPool,
   FIELD_PROBE_CONCURRENCY,
+  uniquePartZipIndex,
 } = require('./optimize.js');
 
 let passed = 0;
@@ -442,6 +443,21 @@ run('mapPool preserves order under concurrency=2 (subprocess, real shipped fn)',
     timeout: 10000,
   });
   assertEqual(r.status, 0, `mapPool child exit 0 (stderr=${r.stderr || ''})`);
+});
+
+
+// uniquePartZipIndex — multiparts must not collide on DB zip_index
+run('uniquePartZipIndex: parts do not share zip indices', () => {
+  const part1 = [0, 1, 2].map((c) => uniquePartZipIndex(1, c));
+  const part2 = [0, 1, 2].map((c) => uniquePartZipIndex(2, c));
+  assertEqual(part1[0], 0, 'part1 chunk0');
+  assertEqual(part1[1], 1, 'part1 chunk1');
+  assertEqual(part2[0], 100, 'part2 chunk0');
+  assertEqual(part2[1], 101, 'part2 chunk1');
+  const all = new Set([...part1, ...part2]);
+  assertEqual(all.size, 6, 'no collisions across two parts');
+  // Old bug: chunkIdx alone would collide
+  assertTrue(part1[0] !== part2[0], 'part1[0] !== part2[0]');
 });
 
 // ---------------------------------------------------------------------------

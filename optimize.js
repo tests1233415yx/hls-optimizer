@@ -392,6 +392,19 @@ const WORK_DIR = process.env.HLS_WORK_DIR
 const INPUT_FILE = path.join(WORK_DIR, 'input.txt');
 const OUTPUT_DIR = path.join(WORK_DIR, 'hls-output');
 const MAX_ZIP_BYTES = 1024 * 1024 * 1024; // 1GB limit for zipped segments
+
+/**
+ * Zip index unique across multi-part jobs for a single (zipType, streamIndex).
+ * DB uniqueness is (variant_id, zip_type, stream_index, zip_index); chunk
+ * counters alone collide across parts and overwrite earlier zip rows → 404.
+ * Capacity: 100 zip batches per part (100GB raw at MAX_ZIP_BYTES) is plenty.
+ */
+function uniquePartZipIndex(partIndex, chunkIndex) {
+  const p = Math.max(1, parseInt(partIndex, 10) || 1);
+  const c = Math.max(0, parseInt(chunkIndex, 10) || 0);
+  return (p - 1) * 100 + c;
+}
+
 let globalProxyServer = null;
 
 // Standard API Request helper
@@ -3527,7 +3540,7 @@ async function main() {
           completedSubtitleZips.push({
             zipType: 'audio',
             streamIndex: streamIdx,
-            zipIndex: chunkIdx,
+            zipIndex: uniquePartZipIndex(partIndex, chunkIdx),
             assetId: uploadRes.id,
             url: uploadRes.browser_download_url,
             zipSize,
@@ -3869,7 +3882,7 @@ async function main() {
     async function uploadZipBatch() {
       if (pendingFiles.length === 0) return;
       
-      const uniqueZipIndex = (partIndex - 1) * 100 + currentZipIndex;
+      const uniqueZipIndex = uniquePartZipIndex(partIndex, currentZipIndex);
       const zipName = `segments-${label}-${codec}-part${partIndex.toString().padStart(4, '0')}-${currentZipIndex.toString().padStart(4, '0')}.zip`;
       const zipPath = path.join(WORK_DIR, zipName);
       
@@ -4283,5 +4296,6 @@ if (require.main === module) {
     mergeIdetWindowStats,
     mapPool,
     FIELD_PROBE_CONCURRENCY,
+    uniquePartZipIndex,
   };
 }
