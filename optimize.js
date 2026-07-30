@@ -3416,7 +3416,11 @@ async function main() {
           '-segment_times', forcedKeyframeString,
           '-segment_format', 'mp4',
           '-segment_format_options', 'movflags=+frag_keyframe+empty_moov+default_base_moof',
-          '-segment_header_filename', `"${audInitName}"`,
+          // Unlike -hls_fmp4_init_filename (resolved against the playlist's directory),
+          // the segment muxer opens this path relative to the process CWD - a bare name
+          // dropped the init outside OUTPUT_DIR, so it never got zipped and every
+          // audio_N_partNNNN_init.mp4 request 404'd. Write it where the packager looks.
+          '-segment_header_filename', `"${path.join(OUTPUT_DIR, audInitName)}"`,
           '-reset_timestamps', '0',
           '-segment_list_type', 'hls',
           '-segment_list', `"${audSegmentListTmpPath}"`,
@@ -3504,6 +3508,12 @@ async function main() {
           const fullPath = path.join(OUTPUT_DIR, name);
           const size = (await fs.promises.stat(fullPath)).size;
           trackFiles.push({ name, fullPath, size, segmentIndex });
+        }
+
+        // Without the init in the zip the playlist's EXT-X-MAP is a permanent 404 and the
+        // track never plays - fail the job here instead of publishing a broken rendition.
+        if (!trackFiles.some(f => audioInitRegex.test(f.name))) {
+          throw new Error(`Audio init segment ${audInitName} missing from ${OUTPUT_DIR} after ffmpeg`);
         }
 
         trackFiles.sort((a, b) => {
