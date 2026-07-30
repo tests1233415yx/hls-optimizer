@@ -809,14 +809,49 @@ function rewriteVariantPlaylist({ playlistText, fileId, label }) {
       if (!line) return line;
       if (line.startsWith('#EXT-X-MAP:')) {
         return line.replace(/URI="([^"]+)"/, (_m, uri) => {
-          const newUri = `${base}/segment/${encodeURIComponent(uri)}`;
+          // Already absolute (partial rewrite / re-entry) — keep leaf name only.
+          let name = uri;
+          if (uri.includes('/segment/')) {
+            name = decodeURIComponent(uri.split('/segment/').pop().split('?')[0]);
+          } else if (uri.includes('/')) {
+            name = decodeURIComponent(uri.split('/').pop().split('?')[0]);
+          }
+          const newUri = `${base}/segment/${encodeURIComponent(name)}`;
           return `URI="${newUri}"`;
         });
       }
       if (line.startsWith('#')) return line;
-      return `${base}/segment/${encodeURIComponent(line)}`;
+      let name = line;
+      if (line.includes('/segment/')) {
+        name = decodeURIComponent(line.split('/segment/').pop().split('?')[0]);
+      } else if (line.includes('/')) {
+        name = decodeURIComponent(line.split('/').pop().split('?')[0]);
+      }
+      return `${base}/segment/${encodeURIComponent(name)}`;
     })
     .join('\n');
+}
+
+/**
+ * Label used in absolute media playlist segment URLs. Master points audio/subs at the
+ * highest video variant; prefer the tallest video resolution so early (partial)
+ * callbacks match what the player will request.
+ */
+function resolveManifestRewriteLabel(rawResolutions, codecs, jobLabel) {
+  const nonVideo = new Set(['metadata', 'audio', 'subtitles', 'thumbnails']);
+  const videoRes = (rawResolutions || []).filter((r) => r && !nonVideo.has(r.label));
+  let best = videoRes[0] || (rawResolutions && rawResolutions[0]) || { label: jobLabel || '1080p' };
+  for (const r of videoRes) {
+    if ((r.targetHeight || 0) > (best.targetHeight || 0)) best = r;
+  }
+  const codecList = Array.isArray(codecs) && codecs.length ? codecs : ['h264'];
+  const useCodecSuffix = codecList.length > 1;
+  const primaryCodec = codecList[0] || 'h264';
+  if (jobLabel && !nonVideo.has(jobLabel)) {
+    return useCodecSuffix ? `${jobLabel}_${primaryCodec}` : jobLabel;
+  }
+  const baseLabel = best.label || '1080p';
+  return useCodecSuffix ? `${baseLabel}_${primaryCodec}` : baseLabel;
 }
 
 async function createNewRelease(owner, repo, fileId, label, partIndex, token) {
@@ -3022,6 +3057,8 @@ async function main() {
             const rawSize = (await fs.promises.stat(fullVttPath)).size;
             console.log(`Subtitle stream #${sub.index} converted to single VTT (${(rawSize / 1024).toFixed(1)} KB)`);
 
+            const rawSubPlaylist = buildSingleSegmentVttPlaylist(videoDurationVal, `subtitle_${sub.index}.vtt`);
+            const rewriteLabel = resolveManifestRewriteLabel(rawResolutions, codecs, activeLabel);
             subtitlePlaylists.push({
               streamIndex: sub.index,
               language: sub.language,
@@ -3033,7 +3070,11 @@ async function main() {
               format: 'vtt',
               codec: sub.codec,
               disposition: sub.disposition || null,
-              playlistText: buildSingleSegmentVttPlaylist(videoDurationVal, `subtitle_${sub.index}.vtt`)
+              playlistText: rewriteVariantPlaylist({
+                playlistText: rawSubPlaylist,
+                fileId: file_id,
+                label: rewriteLabel,
+              }) || rawSubPlaylist,
             });
 
             // Zip and Upload this stream's single VTT file immediately
@@ -3516,6 +3557,14 @@ async function main() {
           }
         }
         await flush();
+        // Rewrite BEFORE partial callback. totalParts=1 merge can finalize from this
+        // payload alone; bare relative names then resolve next to .../audio/N/ and 404.
+        const rewriteLabel = resolveManifestRewriteLabel(rawResolutions, codecs, activeLabel);
+        const rewrittenAudForPartial = rewriteVariantPlaylist({
+          playlistText: rawAudPlaylist,
+          fileId: file_id,
+          label: rewriteLabel,
+        });
         await postPartialStreamCallback({
           audios: [{
             streamIndex: aud.index,
@@ -3524,7 +3573,7 @@ async function main() {
             isDefault: aud.index === defaultAudioIndex,
             disposition: aud.disposition || null,
             playlistUrl: undefined,
-            playlistText: rawAudPlaylist,
+            playlistText: rewrittenAudForPartial || rawAudPlaylist,
           }],
         });
       } catch (err) {
