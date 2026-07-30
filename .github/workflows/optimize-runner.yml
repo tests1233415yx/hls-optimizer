@@ -9,7 +9,7 @@ on:
 jobs:
   run-matrix:
     name: "${{ matrix.chunk_index }}: ${{ matrix.resolution.label }} - P${{ matrix.part.part_index }}"
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(inputs.matrix_json) }}
