@@ -3003,7 +3003,7 @@ async function main() {
             const zipPath = path.join(WORK_DIR, zipName);
             console.log(`Packaging bitmap subtitle ZIP ${zipName}...`);
             const listFilePath = path.join(WORK_DIR, `${zipName}.list.txt`);
-            fs.writeFileSync(listFilePath, subExtPath, 'utf8');
+            await fs.promises.writeFile(listFilePath, subExtPath, 'utf8');
 
             try {
               execSync(`zip -0 -j "${zipPath}" -@ < "${listFilePath}"`, { stdio: 'ignore' });
@@ -3054,7 +3054,7 @@ async function main() {
 
           if (fs.existsSync(fullVttPath)) {
             const patchedVtt = ensureVttTimestampMap(fs.readFileSync(fullVttPath, 'utf8'));
-            fs.writeFileSync(fullVttPath, patchedVtt, 'utf8');
+            await fs.promises.writeFile(fullVttPath, patchedVtt, 'utf8');
             const rawSize = (await fs.promises.stat(fullVttPath)).size;
             console.log(`Subtitle stream #${sub.index} converted to single VTT (${(rawSize / 1024).toFixed(1)} KB)`);
 
@@ -3084,7 +3084,7 @@ async function main() {
             const zipPath = path.join(WORK_DIR, zipName);
             console.log(`Packaging subtitle ZIP ${zipName}...`);
             const listFilePath = path.join(WORK_DIR, `${zipName}.list.txt`);
-            fs.writeFileSync(listFilePath, fullVttPath, 'utf8');
+            await fs.promises.writeFile(listFilePath, fullVttPath, 'utf8');
             try {
               execSync(`zip -0 -j "${zipPath}" -@ < "${listFilePath}"`, { stdio: 'ignore' });
 
@@ -3203,7 +3203,7 @@ async function main() {
           const zipPath = path.join(WORK_DIR, zipName);
           const listFilePath = path.join(WORK_DIR, `${zipName}.list.txt`);
           const filesForZip = [vttPath, ...spriteFiles.map(f => path.join(OUTPUT_DIR, f))];
-          fs.writeFileSync(listFilePath, filesForZip.join('\n'), 'utf8');
+          await fs.promises.writeFile(listFilePath, filesForZip.join('\n'), 'utf8');
 
           try {
             execSync(`zip -0 -j "${zipPath}" -@ < "${listFilePath}"`, { stdio: 'ignore' });
@@ -3513,7 +3513,7 @@ async function main() {
           const zipPath = path.join(WORK_DIR, zipName);
           console.log(`Packaging audio ZIP ${zipName} with ${pendingFiles.length} files...`);
           const listFilePath = path.join(WORK_DIR, `${zipName}.list.txt`);
-          fs.writeFileSync(listFilePath, pendingFiles.map(f => f.fullPath).join('\n'), 'utf8');
+          await fs.promises.writeFile(listFilePath, pendingFiles.map(f => f.fullPath).join('\n'), 'utf8');
           try {
             execSync(`zip -0 -j "${zipPath}" -@ < "${listFilePath}"`, { stdio: 'ignore' });
           } finally {
@@ -3876,7 +3876,7 @@ async function main() {
       console.log(`Packaging ZIP ${zipName} with ${pendingFiles.length} segments...`);
       const listFilePath = path.join(WORK_DIR, `${zipName}.list.txt`);
       const fileContents = pendingFiles.map(f => f.fullPath).join('\n');
-      fs.writeFileSync(listFilePath, fileContents, 'utf8');
+      await fs.promises.writeFile(listFilePath, fileContents, 'utf8');
       try {
         execSync(`zip -0 -j "${zipPath}" -@ < "${listFilePath}"`, { stdio: 'ignore' });
       } finally {
