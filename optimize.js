@@ -2881,9 +2881,10 @@ async function main() {
         } else {
           title = langName ? `Track ${subTrackCounter} - [${langName}]` : `Track ${subTrackCounter}`;
         }
-        const hasTags = !!((lang && lang !== 'und' && lang !== 'undetermined') || getStreamTag(s, 'title') || getStreamTag(s, 'name'));
         let isForced = !!(s.disposition && s.disposition.forced === 1);
-        let isDefault = !!(s.disposition && s.disposition.default === 1 && hasTags);
+        // Honor muxer disposition.default even without language/title tags: many
+        // sources mark the sole/default track with only disposition flags.
+        let isDefault = !!(s.disposition && s.disposition.default === 1);
         let isHearingImpaired = !!(s.disposition && s.disposition.hearing_impaired === 1);
         if (subtitle_metadata && Array.isArray(subtitle_metadata)) {
           const match = subtitle_metadata.find(m => m.streamIndex === s.index);
