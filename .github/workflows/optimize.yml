@@ -6,16 +6,16 @@ jobs:
   setup:
     runs-on: self-hosted
     outputs:
-      kind: ${{ steps.set-matrix.outputs.kind }}
-      parts_json: ${{ steps.set-matrix.outputs.parts_json }}
-      resolutions_json: ${{ steps.set-matrix.outputs.resolutions_json }}
+      kind: ${{ steps.parse.outputs.kind }}
+      parts_json: ${{ steps.parse.outputs.parts_json }}
+      resolutions_json: ${{ steps.parse.outputs.resolutions_json }}
     steps:
       - name: Set up Node.js
         uses: actions/setup-node@v6
         with:
           node-version: 24
-      - name: Generate part/resolution lists
-        id: set-matrix
+      - name: Parse payload
+        id: parse
         run: |
           node -e '
             const fs = require("fs");
@@ -28,103 +28,17 @@ jobs:
             console.log(`resolutions_json=${JSON.stringify(resolutions)}`);
           ' >> "$GITHUB_OUTPUT"
 
-  # Probes interlacing/scene-cuts ONCE per part (not once per resolution) since both are
-  # part-scoped, not resolution-scoped. Skipped entirely for kind=="original" (plain remux),
-  # which never uses this data anyway - see shouldComputeSegmentTimeline() in optimize.js.
-  detect-fields:
+  # One call to per-part-runner.yml PER PART, all in parallel (matrix). Each call
+  # independently detects its own part's field/scene plan, then fans out its own
+  # resolution jobs as soon as ITS detection is done - it never waits on other parts.
+  per-part:
     needs: setup
-    if: needs.setup.outputs.kind != 'original'
-    uses: ./.github/workflows/field-detect-runner.yml
-    with:
-      parts_json: ${{ needs.setup.outputs.parts_json }}
-    secrets: inherit
-
-  build-matrix:
-    needs: [setup, detect-fields]
-    if: always() && needs.setup.result == 'success'
-    runs-on: self-hosted
-    outputs:
-      chunks: ${{ steps.build.outputs.chunks }}
-    steps:
-      - name: Set up Node.js
-        uses: actions/setup-node@v6
-        with:
-          node-version: 24
-      - name: Download field plans
-        if: needs.setup.outputs.kind != 'original'
-        uses: actions/download-artifact@v4
-        with:
-          pattern: field-plan-*
-          path: field-plans
-          merge-multiple: false
-        continue-on-error: true
-      - name: Build resolution x part matrix
-        id: build
-        env:
-          PARTS_JSON: ${{ needs.setup.outputs.parts_json }}
-          RESOLUTIONS_JSON: ${{ needs.setup.outputs.resolutions_json }}
-        run: |
-          echo "chunks<<EOF" >> $GITHUB_OUTPUT
-          node -e '
-            const fs = require("fs");
-            const path = require("path");
-
-            const resolutions = JSON.parse(process.env.RESOLUTIONS_JSON);
-            const parts = JSON.parse(process.env.PARTS_JSON).include;
-
-            // Merge each part-detect artifact (field-plans/field-plan-<idx>/field-detect.json)
-            // into its matching part by part_index. Missing/unreadable artifacts are left as-is -
-            // the resolution job then falls back to computing it itself, same as before this change.
-            const plansDir = "field-plans";
-            if (fs.existsSync(plansDir)) {
-              for (const part of parts) {
-                const dir = path.join(plansDir, `field-plan-${part.part_index}`);
-                const file = path.join(dir, "field-detect.json");
-                if (fs.existsSync(file)) {
-                  try {
-                    const result = JSON.parse(fs.readFileSync(file, "utf8"));
-                    if (result.field_plan) part.field_plan = result.field_plan;
-                    if (result.forced_keyframe_string) part.forced_keyframe_string = result.forced_keyframe_string;
-                  } catch (e) {
-                    console.warn(`Failed to parse field plan for part ${part.part_index}:`, e.message);
-                  }
-                }
-              }
-            }
-
-            let include = [];
-            for (const r of resolutions) {
-              for (const p of parts) {
-                if ((r.label === "subtitles" || r.label === "thumbnails") && p.part_index > 1) {
-                  continue; // Only run subtitles/thumbnails for Part 1
-                }
-                include.push({ resolution: r, part: p });
-              }
-            }
-
-            const CHUNK_SIZE = 256;
-            const chunks = [];
-            for (let i = 0; i < include.length; i += CHUNK_SIZE) {
-              const chunkIndex = Math.floor(i / CHUNK_SIZE) + 1;
-              const chunkItems = include.slice(i, i + CHUNK_SIZE).map(item => ({
-                ...item,
-                chunk_index: chunkIndex
-              }));
-              chunks.push({
-                include: chunkItems
-              });
-            }
-            console.log(JSON.stringify(chunks));
-          ' >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
-
-  optimize:
-    needs: build-matrix
     strategy:
       fail-fast: false
-      matrix:
-        chunk: ${{ fromJson(needs.build-matrix.outputs.chunks) }}
-    uses: ./.github/workflows/optimize-runner.yml
+      matrix: ${{ fromJson(needs.setup.outputs.parts_json) }}
+    uses: ./.github/workflows/per-part-runner.yml
     with:
-      matrix_json: ${{ toJson(matrix.chunk) }}
+      kind: ${{ needs.setup.outputs.kind }}
+      part_json: ${{ toJson(matrix) }}
+      resolutions_json: ${{ needs.setup.outputs.resolutions_json }}
     secrets: inherit

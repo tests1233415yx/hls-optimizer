@@ -2809,9 +2809,9 @@ async function main() {
   const fileSize = format.size ? parseInt(format.size, 10) : 0;
 
   // Standalone mode: probe once per PART (not per resolution) and hand the result back
-  // to the caller via FIELD_DETECT_OUTPUT_PATH instead of encoding anything. Resolution
-  // jobs pick this up through ACTIVE_PART.field_plan/forced_keyframe_string and skip
-  // recomputation; see the fallback check further down for what happens if this is absent.
+  // to the caller via FIELD_DETECT_OUTPUT_PATH instead of encoding anything. Invoked
+  // sequentially, once per part, by a single dedicated workflow job before the resolution
+  // fan-out - see the hard-fail check further down for what happens if this never ran.
   if (process.env.FIELD_DETECT_ONLY === '1') {
     const forceStrategy = normalizeFieldStrategy((vps && vps.field_strategy) || process.env.HLS_FIELD_STRATEGY || 'auto');
     const forceParity = normalizeFieldParity((vps && vps.field_parity) || process.env.HLS_FIELD_PARITY || 'auto');
@@ -2836,7 +2836,7 @@ async function main() {
     console.log(`FIELD_DETECT_RESULT=${JSON.stringify(result)}`);
     process.exit(0);
   }
-  
+
   let origBitrateKbps = vps && vps.source_bitrate_kbps ? parseInt(vps.source_bitrate_kbps, 10) : null;
   if (!origBitrateKbps) {
     if (format.bit_rate) {
@@ -3323,8 +3323,8 @@ async function main() {
   // scene-aligned points as video instead of its own flat interval - see the aligned
   // branch in the audio ffmpeg command for why that matters.
   //
-  // Audio is never in the same runner as video. Standalone audio jobs must recompute
-  // the same field plan + scene-cut grid as the video encode jobs so -segment_times
+  // Audio is never in the same runner as video. Standalone audio jobs use the same
+  // precomputed field plan + scene-cut grid as the video encode jobs so -segment_times
   // matches -force_key_frames. Skipping isAudioJob left audio on flat -hls_time 6.
   let forcedKeyframeString = null;
   // Default hybrid: quality-safe if detection fails open before detectFieldStrategy returns.
@@ -3336,54 +3336,19 @@ async function main() {
     'default-before-detect',
   );
 
-  const forceStrategy = normalizeFieldStrategy(
-    (vps && vps.field_strategy) || process.env.HLS_FIELD_STRATEGY || 'auto',
-  );
-  const forceParity = normalizeFieldParity(
-    (vps && vps.field_parity) || process.env.HLS_FIELD_PARITY || 'auto',
-  );
-
-  if (shouldComputeSegmentTimeline(kind, { isSubtitlesJob, isThumbnailsJob }) && activePart && activePart.field_plan) {
+  // Field strategy + scene-cut timeline are part-scoped, not resolution-scoped: a
+  // dedicated workflow job computes them ONCE per part (FIELD_DETECT_ONLY above) before
+  // any resolution job runs, and hands the result down via ACTIVE_PART.field_plan. No
+  // fallback here on purpose: if it's missing, that precompute step didn't run or failed,
+  // and silently recomputing per-resolution would hide that instead of surfacing it.
+  if (shouldComputeSegmentTimeline(kind, { isSubtitlesJob, isThumbnailsJob })) {
+    if (!activePart || !activePart.field_plan) {
+      console.error(`Error: no precomputed field plan for part ${partIndex}. The field-detect step must run before resolution jobs.`);
+      process.exit(1);
+    }
     fieldPlan = activePart.field_plan;
     if (activePart.forced_keyframe_string) forcedKeyframeString = activePart.forced_keyframe_string;
     console.log(`Using precomputed field plan for part ${partIndex}: ${JSON.stringify(fieldPlan)}`);
-  } else if (shouldComputeSegmentTimeline(kind, { isSubtitlesJob, isThumbnailsJob })) {
-    try {
-      fieldPlan = await detectFieldStrategy(inputSource, videoStream, startTime, {
-        forceStrategy,
-        forceParity,
-        endTime: endTime !== null ? endTime : duration,
-      });
-    } catch (e) {
-      console.warn('Field detection failed, keeping hybrid bwdif:', e.message || e);
-      fieldPlan = makeFieldPlan(
-        'hybrid',
-        forceParity === 'auto' ? 'auto' : forceParity,
-        buildBwdifFilter('send_frame', forceParity),
-        null,
-        'detect-error-fail-open',
-      );
-    }
-    console.log(`FIELD_PLAN_JSON=${JSON.stringify(fieldPlan)}`);
-
-    console.log(
-      isAudioJob
-        ? 'Pre-analysis (audio job): scene cuts on post-field clock for A/V-aligned segment splits...'
-        : 'Pre-analysis: scene cuts on post-field clock for keyframe alignment...',
-    );
-    try {
-      const chunkDuration = (endTime !== null ? endTime : duration) - startTime;
-      const sceneCuts = await detectSceneCuts(inputSource, startTime, endTime, fieldPlan);
-      const forcedTimestamps = generateKeyframeTimeline(sceneCuts, chunkDuration, 6, 3, 9);
-      if (forcedTimestamps.length > 0) {
-        forcedKeyframeString = forcedTimestamps.map(t => t.toFixed(3)).join(',');
-        console.log(`Generated timeline with ${forcedTimestamps.length} keyframe alignment points: ${forcedKeyframeString}`);
-      } else {
-        console.log('No keyframe alignment points generated, falling back to default keyframes.');
-      }
-    } catch (e) {
-      console.warn('Pre-analysis failed:', e);
-    }
   } else {
     fieldPlan = makeFieldPlan('progressive', 'auto', null, null, 'non-encode-job');
   }
