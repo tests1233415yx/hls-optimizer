@@ -1,18 +1,18 @@
-name: HLS Video Optimizer Runner (Self-Hosted)
+name: HLS Field/Scene Detection (Self-Hosted)
 on:
   workflow_call:
     inputs:
-      matrix_json:
+      parts_json:
         required: true
         type: string
 
 jobs:
-  run-matrix:
-    name: "${{ matrix.chunk_index }}: ${{ matrix.resolution.label }} - P${{ matrix.part.part_index }}"
+  detect-part:
+    name: "Field detect: Part ${{ matrix.part_index }}"
     runs-on: self-hosted
     strategy:
       fail-fast: false
-      matrix: ${{ fromJson(inputs.matrix_json) }}
+      matrix: ${{ fromJson(inputs.parts_json) }}
     permissions:
       contents: read
     steps:
@@ -75,31 +75,32 @@ jobs:
             rm -rf "$DL" "$EXTRACT"
             [ -n "$REMOTE_VERSION" ] && echo "$REMOTE_VERSION" > "$STAMP"
             ffmpeg -version | head -1
-            ffmpeg -buildconf | grep svtav1 || (echo "ERROR: libsvtav1 not compiled into this ffmpeg build" && exit 1)
-            ffmpeg -h encoder=libx264 2>&1 | grep -q yuv420p10le || echo "WARNING: libx264 in this ffmpeg build lacks 10-bit (yuv420p10le) support — 10-bit sources will fall back to 8-bit encoding"
           fi
       - name: Configure work directory
         run: |
-          # Use RUNNER_TEMP, which is native to each self-hosted runner instance
-          # (e.g., /root/actions-runner-1/_work/_temp). This guarantees complete
-          # isolation between runner agents on the same VPS without littering $HOME.
-          # Append run, matrix chunk, resolution, and part index details so parallel
-          # jobs never collide or wipe each other's cache/work directories during post-cleanup.
-          WORKDIR="${RUNNER_TEMP:-/tmp}/hls-work-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${{ matrix.chunk_index }}-${{ matrix.resolution.label }}-P${{ matrix.part.part_index }}"
+          WORKDIR="${RUNNER_TEMP:-/tmp}/hls-field-detect-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${{ matrix.part_index }}"
           mkdir -p "$WORKDIR"
           echo "HLS_WORK_DIR=$WORKDIR" >> "$GITHUB_ENV"
+          echo "FIELD_DETECT_OUTPUT_PATH=$WORKDIR/field-detect.json" >> "$GITHUB_ENV"
           echo "Work dir: $WORKDIR"
-      - name: Run HLS Optimizer
+      - name: Run field/scene detection
         env:
-          ACTIVE_RESOLUTION_LABEL: ${{ matrix.resolution.label }}
-          ACTIVE_PART: ${{ toJson(matrix.part) }}
+          FIELD_DETECT_ONLY: '1'
+          ACTIVE_PART: ${{ toJson(matrix) }}
           PRIVATE_REPO_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
         run: |
           node optimize.js
+      - name: Upload field plan
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: field-plan-${{ matrix.part_index }}
+          path: ${{ env.FIELD_DETECT_OUTPUT_PATH }}
+          if-no-files-found: ignore
+          retention-days: 1
       - name: Cleanup work directory
         if: always()
         run: |
           if [ -n "$HLS_WORK_DIR" ] && [ -d "$HLS_WORK_DIR" ]; then
-            echo "Cleaning up work directory: $HLS_WORK_DIR"
             rm -rf "$HLS_WORK_DIR" 2>/dev/null || true
           fi

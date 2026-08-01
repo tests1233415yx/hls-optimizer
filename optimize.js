@@ -2807,6 +2807,35 @@ async function main() {
   const format = probeData.format || {};
   const duration = format.duration ? parseFloat(format.duration) : (vps && vps.duration ? parseFloat(vps.duration) : 0);
   const fileSize = format.size ? parseInt(format.size, 10) : 0;
+
+  // Standalone mode: probe once per PART (not per resolution) and hand the result back
+  // to the caller via FIELD_DETECT_OUTPUT_PATH instead of encoding anything. Resolution
+  // jobs pick this up through ACTIVE_PART.field_plan/forced_keyframe_string and skip
+  // recomputation; see the fallback check further down for what happens if this is absent.
+  if (process.env.FIELD_DETECT_ONLY === '1') {
+    const forceStrategy = normalizeFieldStrategy((vps && vps.field_strategy) || process.env.HLS_FIELD_STRATEGY || 'auto');
+    const forceParity = normalizeFieldParity((vps && vps.field_parity) || process.env.HLS_FIELD_PARITY || 'auto');
+    let fieldPlan;
+    try {
+      fieldPlan = await detectFieldStrategy(inputSource, videoStream, startTime, {
+        forceStrategy, forceParity, endTime: endTime !== null ? endTime : duration,
+      });
+    } catch (e) {
+      fieldPlan = makeFieldPlan('hybrid', forceParity === 'auto' ? 'auto' : forceParity,
+        buildBwdifFilter('send_frame', forceParity), null, 'detect-error-fail-open');
+    }
+    let forcedKeyframeString = null;
+    try {
+      const chunkDuration = (endTime !== null ? endTime : duration) - startTime;
+      const sceneCuts = await detectSceneCuts(inputSource, startTime, endTime, fieldPlan);
+      const forcedTimestamps = generateKeyframeTimeline(sceneCuts, chunkDuration, 6, 3, 9);
+      if (forcedTimestamps.length > 0) forcedKeyframeString = forcedTimestamps.map(t => t.toFixed(3)).join(',');
+    } catch (e) {}
+    const result = { field_plan: fieldPlan, forced_keyframe_string: forcedKeyframeString };
+    fs.writeFileSync(process.env.FIELD_DETECT_OUTPUT_PATH, JSON.stringify(result));
+    console.log(`FIELD_DETECT_RESULT=${JSON.stringify(result)}`);
+    process.exit(0);
+  }
   
   let origBitrateKbps = vps && vps.source_bitrate_kbps ? parseInt(vps.source_bitrate_kbps, 10) : null;
   if (!origBitrateKbps) {
@@ -3314,7 +3343,11 @@ async function main() {
     (vps && vps.field_parity) || process.env.HLS_FIELD_PARITY || 'auto',
   );
 
-  if (shouldComputeSegmentTimeline(kind, { isSubtitlesJob, isThumbnailsJob })) {
+  if (shouldComputeSegmentTimeline(kind, { isSubtitlesJob, isThumbnailsJob }) && activePart && activePart.field_plan) {
+    fieldPlan = activePart.field_plan;
+    if (activePart.forced_keyframe_string) forcedKeyframeString = activePart.forced_keyframe_string;
+    console.log(`Using precomputed field plan for part ${partIndex}: ${JSON.stringify(fieldPlan)}`);
+  } else if (shouldComputeSegmentTimeline(kind, { isSubtitlesJob, isThumbnailsJob })) {
     try {
       fieldPlan = await detectFieldStrategy(inputSource, videoStream, startTime, {
         forceStrategy,
