@@ -8,7 +8,7 @@ jobs:
     outputs:
       kind: ${{ steps.parse.outputs.kind }}
       parts_json: ${{ steps.parse.outputs.parts_json }}
-      resolutions_json: ${{ steps.parse.outputs.resolutions_json }}
+      chunks_json: ${{ steps.parse.outputs.chunks_json }}
     steps:
       - name: Set up Node.js
         uses: actions/setup-node@v6
@@ -23,22 +23,119 @@ jobs:
             const payload = event.client_payload || {};
             const resolutions = payload.resolutions || [{"label":"1080p"}];
             const parts = payload.parts || [{"part_index":1,"start_time":0,"end_time":null,"start_segment_index":0,"extract_subtitles":true,"extract_audio":true}];
+
+            const include = [];
+            for (const part of parts) {
+              for (const r of resolutions) {
+                if ((r.label === "subtitles" || r.label === "thumbnails") && part.part_index > 1) {
+                  continue; // Only run subtitles/thumbnails for Part 1
+                }
+                include.push({ resolution: r, part, chunk_index: 1 });
+              }
+            }
+
             console.log(`kind=${payload.kind || ""}`);
             console.log(`parts_json=${JSON.stringify({ include: parts })}`);
-            console.log(`resolutions_json=${JSON.stringify(resolutions)}`);
+            console.log(`chunks_json=${JSON.stringify({ include })}`);
           ' >> "$GITHUB_OUTPUT"
 
-  # One call to per-part-runner.yml PER PART, all in parallel (matrix). Each call
-  # independently detects its own part's field/scene plan, then fans out its own
-  # resolution jobs as soon as ITS detection is done - it never waits on other parts.
-  per-part:
+  # Field strategy + scene-cut timeline are part-scoped, not resolution-scoped (see
+  # shouldComputeSegmentTimeline() in optimize.js) - probed once per part here, all parts
+  # in parallel. Each cell uploads its own field-plan-part{N}.json release asset directly;
+  # optimize (below) fetches its own part's asset itself, so no job merges results here.
+  # Skipped for kind=="original" (plain remux), which never uses this data.
+  detect:
     needs: setup
+    if: needs.setup.outputs.kind != 'original'
+    runs-on: self-hosted
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.setup.outputs.parts_json) }}
-    uses: ./.github/workflows/per-part-runner.yml
+    steps:
+      - name: Checkout worker repository
+        uses: actions/checkout@v6
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+      - name: Install System Dependencies
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          NEED_APT=0
+          for bin in zip unxz curl; do
+            command -v "$bin" >/dev/null || NEED_APT=1
+          done
+          if [ "$NEED_APT" = "1" ]; then
+            sudo flock /var/lib/dpkg/lock-frontend -c "apt-get update -qq && apt-get install -y zip xz-utils curl"
+          fi
+          FFDIR="$HOME/.cache/ffmpeg-${RUNNER_NAME:-default}"
+          mkdir -p "$FFDIR"
+          echo "$FFDIR" >> "$GITHUB_PATH"
+          export PATH="$FFDIR:$PATH"
+
+          STAMP="$FFDIR/.build-stamp"
+          case "$(uname -m)" in
+            aarch64|arm64) FFARCH=linuxarm64 ;;
+            *) FFARCH=linux64 ;;
+          esac
+          ASSET=ffmpeg-master-latest-${FFARCH}-gpl.tar.xz
+          REMOTE_VERSION=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" https://api.github.com/repos/BtbN/FFmpeg-Builds/releases/tags/latest \
+            | grep -A40 "\"name\": \"$ASSET\"" | grep -m1 '"updated_at"' | sed -E 's/.*"updated_at": *"([^"]+)".*/\1/')
+
+          if [ -n "$REMOTE_VERSION" ] && command -v ffmpeg >/dev/null \
+             && [ "$(cat "$STAMP" 2>/dev/null)" = "$REMOTE_VERSION" ] \
+             && ffmpeg -buildconf 2>/dev/null | grep -q svtav1; then
+            echo "ffmpeg already up to date ($REMOTE_VERSION), skipping download"
+            ffmpeg -version | head -1
+          else
+            echo "Downloading FFmpeg static build (remote build: ${REMOTE_VERSION:-unknown, API lookup failed})..."
+            DL="${RUNNER_TEMP:-/tmp}/ffmpeg.tar.xz"
+            EXTRACT="${RUNNER_TEMP:-/tmp}/ffmpeg-extract"
+            if ! curl -fsSL --retry 5 --retry-delay 5 https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/$ASSET -o "$DL"; then
+              echo "Error: Failed to download FFmpeg from BtbN/FFmpeg-Builds."
+              exit 1
+            fi
+            if head -n 5 "$DL" | grep -q -i -E "html|doctype|xml"; then
+              echo "Error: Downloaded file is HTML/XML instead of a valid archive. Printing contents:"
+              cat "$DL" | head -n 50
+              exit 1
+            fi
+            mkdir -p "$EXTRACT"
+            tar -xf "$DL" -C "$EXTRACT" --strip-components=1
+            cp "$EXTRACT/bin/ffmpeg" "$EXTRACT/bin/ffprobe" "$FFDIR/"
+            chmod +x "$FFDIR/ffmpeg" "$FFDIR/ffprobe"
+            rm -rf "$DL" "$EXTRACT"
+            [ -n "$REMOTE_VERSION" ] && echo "$REMOTE_VERSION" > "$STAMP"
+            ffmpeg -version | head -1
+          fi
+      - name: Configure work directory
+        run: |
+          WORKDIR="${RUNNER_TEMP:-/tmp}/hls-field-detect-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-P${{ matrix.part_index }}"
+          mkdir -p "$WORKDIR"
+          echo "HLS_WORK_DIR=$WORKDIR" >> "$GITHUB_ENV"
+          echo "FIELD_DETECT_OUTPUT_PATH=$WORKDIR/field-detect.json" >> "$GITHUB_ENV"
+      - name: Run field/scene detection for this part
+        env:
+          FIELD_DETECT_ONLY: '1'
+          ACTIVE_PART: ${{ toJson(matrix) }}
+          EVENT_PAYLOAD: ${{ toJson(github.event.client_payload) }}
+          PRIVATE_REPO_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+        run: |
+          node optimize.js
+      - name: Cleanup work directory
+        if: always()
+        run: |
+          rm -rf "${RUNNER_TEMP:-/tmp}/hls-field-detect-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-P${{ matrix.part_index }}" 2>/dev/null || true
+
+  # Single flat matrix over every part x resolution combo (built by setup, unchanged by
+  # detect). Waits for the whole detect matrix (needs:) so no runner sits idle polling for
+  # an asset that isn't there yet, but doesn't merge any per-part data itself - each cell
+  # fetches its own field-plan-part{N}.json release asset directly inside optimize.js.
+  optimize:
+    needs: [setup, detect]
+    if: always() && (needs.detect.result == 'success' || needs.detect.result == 'skipped')
+    uses: ./.github/workflows/optimize-runner.yml
     with:
-      kind: ${{ needs.setup.outputs.kind }}
-      part_json: ${{ toJson(matrix) }}
-      resolutions_json: ${{ needs.setup.outputs.resolutions_json }}
+      matrix_json: ${{ needs.setup.outputs.chunks_json }}
     secrets: inherit

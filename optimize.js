@@ -2808,10 +2808,10 @@ async function main() {
   const duration = format.duration ? parseFloat(format.duration) : (vps && vps.duration ? parseFloat(vps.duration) : 0);
   const fileSize = format.size ? parseInt(format.size, 10) : 0;
 
-  // Standalone mode: probe once per PART (not per resolution) and hand the result back
-  // to the caller via FIELD_DETECT_OUTPUT_PATH instead of encoding anything. Invoked
-  // sequentially, once per part, by a single dedicated workflow job before the resolution
-  // fan-out - see the hard-fail check further down for what happens if this never ran.
+  // Standalone mode: probe once per PART (not per resolution), running in its own matrix
+  // cell in parallel with every other part's probe. Result is uploaded as a release asset
+  // (field-plan-part{N}.json) so resolution jobs - a separate, later workflow job - can
+  // fetch it themselves; see the hard-fail check further down for what happens if missing.
   if (process.env.FIELD_DETECT_ONLY === '1') {
     const forceStrategy = normalizeFieldStrategy((vps && vps.field_strategy) || process.env.HLS_FIELD_STRATEGY || 'auto');
     const forceParity = normalizeFieldParity((vps && vps.field_parity) || process.env.HLS_FIELD_PARITY || 'auto');
@@ -2833,6 +2833,7 @@ async function main() {
     } catch (e) {}
     const result = { field_plan: fieldPlan, forced_keyframe_string: forcedKeyframeString };
     fs.writeFileSync(process.env.FIELD_DETECT_OUTPUT_PATH, JSON.stringify(result));
+    await uploadAssetWithRotation(`field-plan-part${partIndex}.json`, process.env.FIELD_DETECT_OUTPUT_PATH, 'application/json');
     console.log(`FIELD_DETECT_RESULT=${JSON.stringify(result)}`);
     process.exit(0);
   }
@@ -3337,17 +3338,24 @@ async function main() {
   );
 
   // Field strategy + scene-cut timeline are part-scoped, not resolution-scoped: a
-  // dedicated workflow job computes them ONCE per part (FIELD_DETECT_ONLY above) before
-  // any resolution job runs, and hands the result down via ACTIVE_PART.field_plan. No
-  // fallback here on purpose: if it's missing, that precompute step didn't run or failed,
-  // and silently recomputing per-resolution would hide that instead of surfacing it.
+  // dedicated matrix job computes them ONCE per part (FIELD_DETECT_ONLY above) before
+  // this job's workflow stage runs, and uploads the result as a release asset. Fetched
+  // here directly (not passed via ACTIVE_PART) so this job's matrix doesn't need to wait
+  // on a job that merges per-part data into it. No fallback on purpose: if the asset is
+  // missing, that precompute step didn't run or failed, and silently recomputing
+  // per-resolution would hide that instead of surfacing it.
   if (shouldComputeSegmentTimeline(kind, { isSubtitlesJob, isThumbnailsJob })) {
-    if (!activePart || !activePart.field_plan) {
-      console.error(`Error: no precomputed field plan for part ${partIndex}. The field-detect step must run before resolution jobs.`);
+    const fieldPlanAssetName = `field-plan-part${partIndex}.json`;
+    const fieldPlanAsset = targetReleaseInfo.assets.find(a => a.name === fieldPlanAssetName);
+    if (!fieldPlanAsset) {
+      console.error(`Error: no precomputed field plan asset "${fieldPlanAssetName}" for part ${partIndex}. The detect job must run before resolution jobs.`);
       process.exit(1);
     }
-    fieldPlan = activePart.field_plan;
-    if (activePart.forced_keyframe_string) forcedKeyframeString = activePart.forced_keyframe_string;
+    const fieldPlanPath = path.join(WORK_DIR, fieldPlanAssetName);
+    await downloadAsset(fieldPlanAsset.url, token, fieldPlanPath);
+    const result = JSON.parse(fs.readFileSync(fieldPlanPath, 'utf8'));
+    fieldPlan = result.field_plan;
+    if (result.forced_keyframe_string) forcedKeyframeString = result.forced_keyframe_string;
     console.log(`Using precomputed field plan for part ${partIndex}: ${JSON.stringify(fieldPlan)}`);
   } else {
     fieldPlan = makeFieldPlan('progressive', 'auto', null, null, 'non-encode-job');
