@@ -34,6 +34,12 @@ const {
   mapPool,
   FIELD_PROBE_CONCURRENCY,
   uniquePartZipIndex,
+  assertUnderZipCap,
+  batchFilesBySize,
+  MAX_ZIP_BYTES,
+  ZIP_PAYLOAD_BUDGET,
+  packVttIntoSizedFiles,
+  parseVttCueBlocks,
 } = require('./optimize.js');
 
 let passed = 0;
@@ -299,8 +305,8 @@ run('generateKeyframeTimeline: empty scene list falls back to regular targetSec 
 // Thumbnail storyboard (5s / 320 / 10×10 / WebP)
 // ---------------------------------------------------------------------------
 
-run('THUMB_STORYBOARD constants: 5s interval, 480px tiles, 10x10, webp q85', () => {
-  assertEqual(THUMB_STORYBOARD.intervalSec, 5, 'intervalSec');
+run('THUMB_STORYBOARD constants: 1s interval, 480px tiles, 10x10, webp q85', () => {
+  assertEqual(THUMB_STORYBOARD.intervalSec, 1, 'intervalSec');
   assertEqual(THUMB_STORYBOARD.tileWidth, 480, 'tileWidth');
   assertEqual(THUMB_STORYBOARD.cols, 10, 'cols');
   assertEqual(THUMB_STORYBOARD.rows, 10, 'rows');
@@ -308,10 +314,10 @@ run('THUMB_STORYBOARD constants: 5s interval, 480px tiles, 10x10, webp q85', () 
   assertEqual(THUMB_STORYBOARD.webpQuality, 85, 'webpQuality');
 });
 
-run('countStoryboardThumbs: ceil(duration/interval) for ~25 min @ 5s', () => {
-  assertEqual(countStoryboardThumbs(1494.016, 5), 299, '1494.016s / 5s');
-  assertEqual(countStoryboardThumbs(1500, 5), 300, 'exact 25 min');
-  assertEqual(countStoryboardThumbs(0, 5), 0, 'zero duration');
+run('countStoryboardThumbs: ceil(duration/interval) @ 1s', () => {
+  assertEqual(countStoryboardThumbs(1494.016, 1), 1495, '1494.016s / 1s');
+  assertEqual(countStoryboardThumbs(1500, 1), 1500, 'exact 25 min');
+  assertEqual(countStoryboardThumbs(0, 1), 0, 'zero duration');
 });
 
 run('storyboard sheet naming and index (10x10 = 100 tiles/sheet)', () => {
@@ -325,19 +331,70 @@ run('storyboard sheet naming and index (10x10 = 100 tiles/sheet)', () => {
   assertFalse(storyboardSpriteGlob('webp').test('thumb_sprite_001.jpg'), 'glob rejects jpg');
 });
 
-run('buildStoryboardVttBody: cues use 5s steps and .webp #xywh URLs', () => {
-  const body = buildStoryboardVttBody(12, 320, 180, {
-    intervalSec: 5,
+run('buildStoryboardVttBody: cues use 1s steps and .webp #xywh URLs', () => {
+  const body = buildStoryboardVttBody(3, 320, 180, {
+    intervalSec: 1,
     cols: 10,
     rows: 10,
     extension: 'webp',
   });
-  // 12s / 5s → 3 thumbs
-  assertTrue(body.includes('00:00:00.000 --> 00:00:05.000'), 'first cue');
+  // 3s / 1s → 3 thumbs
+  assertTrue(body.includes('00:00:00.000 --> 00:00:01.000'), 'first cue');
   assertTrue(body.includes('thumbnails/thumb_sprite_001.webp#xywh=0,0,320,180'), 'first tile webp');
   assertTrue(body.includes('thumbnails/thumb_sprite_001.webp#xywh=320,0,320,180'), 'second col');
   assertFalse(body.includes('.jpg'), 'no jpeg references');
-  assertEqual(countStoryboardThumbs(12, 5), 3, 'three thumbs for 12s');
+  assertEqual(countStoryboardThumbs(3, 1), 3, 'three thumbs for 3s');
+});
+
+run('assertUnderZipCap / batchFilesBySize: 1 GiB safety', () => {
+  assertEqual(MAX_ZIP_BYTES, 1024 * 1024 * 1024, '1 GiB cap');
+  assertTrue(ZIP_PAYLOAD_BUDGET < MAX_ZIP_BYTES, 'payload budget under cap');
+  let threw = false;
+  try {
+    assertUnderZipCap(MAX_ZIP_BYTES + 1, 'test');
+  } catch (e) {
+    threw = true;
+    assertTrue(/exceeds/.test(e.message), 'error mentions exceeds');
+  }
+  assertTrue(threw, 'oversize throws');
+  assertUnderZipCap(MAX_ZIP_BYTES, 'at-cap-ok'); // exact cap allowed
+
+  const files = [
+    { name: 'a', size: MAX_ZIP_BYTES - 100 },
+    { name: 'b', size: 200 },
+    { name: 'c', size: 50 },
+  ];
+  const batches = batchFilesBySize(files);
+  assertEqual(batches.length, 2, 'second file forces new batch');
+  assertEqual(batches[0].length, 1, 'first batch one file');
+  assertEqual(batches[1].length, 2, 'rest in second batch');
+});
+
+run('packVttIntoSizedFiles: cue-aligned split under budget', () => {
+  const fs = require('fs');
+  const os = require('os');
+  const path = require('path');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vtt-pack-'));
+  try {
+    // Two large cues that force a split when budget is tiny
+    const big = 'x'.repeat(80);
+    const vtt =
+      `WEBVTT\n\n` +
+      `00:00:00.000 --> 00:00:01.000\n${big}\n\n` +
+      `00:00:01.000 --> 00:00:02.000\n${big}\n\n`;
+    const cues = parseVttCueBlocks(vtt);
+    assertEqual(cues.length, 2, 'two cues');
+    const packed = packVttIntoSizedFiles(vtt, 7, dir, 120);
+    assertTrue(packed.files.length >= 2, 'split into multiple files');
+    assertTrue(packed.playlistText.includes('subtitle_7_00000.vtt'), 'playlist seg 0');
+    assertTrue(packed.playlistText.includes('#EXT-X-ENDLIST'), 'endlist');
+    for (const f of packed.files) {
+      assertTrue(fs.existsSync(f.fullPath), f.name);
+      assertTrue(f.size <= 200, 'each part near budget');
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 // ---------------------------------------------------------------------------

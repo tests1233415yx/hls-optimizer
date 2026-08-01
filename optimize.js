@@ -391,7 +391,9 @@ const WORK_DIR = process.env.HLS_WORK_DIR
       : `/tmp/hls-worker-${process.pid}`);
 const INPUT_FILE = path.join(WORK_DIR, 'input.txt');
 const OUTPUT_DIR = path.join(WORK_DIR, 'hls-output');
-const MAX_ZIP_BYTES = 1024 * 1024 * 1024; // 1GB limit for zipped segments
+const MAX_ZIP_BYTES = 1024 * 1024 * 1024; // 1 GiB hard cap for every zip upload
+/** Leave headroom for zip local headers / EOCD so stored payload stays under the cap. */
+const ZIP_PAYLOAD_BUDGET = MAX_ZIP_BYTES - 512 * 1024;
 
 /**
  * Zip index unique across multi-part jobs for a single (zipType, streamIndex).
@@ -403,6 +405,272 @@ function uniquePartZipIndex(partIndex, chunkIndex) {
   const p = Math.max(1, parseInt(partIndex, 10) || 1);
   const c = Math.max(0, parseInt(chunkIndex, 10) || 0);
   return (p - 1) * 100 + c;
+}
+
+function formatMiB(bytes) {
+  return (bytes / 1024 / 1024).toFixed(1);
+}
+
+/**
+ * Fail closed if a payload exceeds the shared 1 GiB zip/asset cap.
+ * Used for raw single files (subs) and finished zip archives (all types).
+ */
+function assertUnderZipCap(bytes, label) {
+  const n = Number(bytes) || 0;
+  if (n > MAX_ZIP_BYTES) {
+    throw new Error(
+      `${label}: ${formatMiB(n)} MiB exceeds ${(MAX_ZIP_BYTES / 1024 / 1024).toFixed(0)} MiB zip cap`,
+    );
+  }
+}
+
+/**
+ * Group { fullPath, size, ... } entries into batches each totaling ≤ maxBytes.
+ * A single entry larger than maxBytes becomes its own batch (caller must
+ * assertUnderZipCap that entry — cannot split format-blind).
+ */
+function batchFilesBySize(files, maxBytes = MAX_ZIP_BYTES) {
+  const batches = [];
+  let pending = [];
+  let pendingSize = 0;
+  for (const f of files) {
+    const size = Number(f.size) || 0;
+    if (pending.length > 0 && pendingSize + size > maxBytes) {
+      batches.push(pending);
+      pending = [];
+      pendingSize = 0;
+    }
+    pending.push(f);
+    pendingSize += size;
+  }
+  if (pending.length > 0) batches.push(pending);
+  return batches;
+}
+
+/**
+ * zip -0 -j the given absolute paths, enforce cap, upload, delete zip.
+ * Returns { assetId, url, zipSize }.
+ */
+async function zipStoreUploadAndCleanup({
+  filePaths,
+  zipName,
+  zipPath,
+  listFilePath,
+  uploadFn,
+}) {
+  if (!filePaths || filePaths.length === 0) {
+    throw new Error(`zipStoreUploadAndCleanup: no files for ${zipName}`);
+  }
+  await fs.promises.writeFile(listFilePath, filePaths.join('\n'), 'utf8');
+  try {
+    execSync(`zip -0 -j "${zipPath}" -@ < "${listFilePath}"`, { stdio: 'ignore' });
+  } finally {
+    try { fs.unlinkSync(listFilePath); } catch (e) {}
+  }
+  const zipSize = (await fs.promises.stat(zipPath)).size;
+  try {
+    assertUnderZipCap(zipSize, `ZIP ${zipName}`);
+    console.log(`Uploading ${zipName} (${formatMiB(zipSize)} MiB)...`);
+    const uploadRes = await uploadFn(zipName, zipPath, 'application/zip');
+    return {
+      assetId: uploadRes.id,
+      url: uploadRes.browser_download_url,
+      zipSize,
+    };
+  } finally {
+    try { fs.unlinkSync(zipPath); } catch (e) {}
+  }
+}
+
+/** Parse WebVTT into cue blocks (raw text between timing lines). */
+function parseVttCueBlocks(vttContent) {
+  const lines = String(vttContent || "").replace(/^\uFEFF/, "").split(/\r?\n/);
+  const cues = [];
+  let i = 0;
+  // skip header until blank after WEBVTT
+  while (i < lines.length && !lines[i].includes("-->")) {
+    i++;
+  }
+  while (i < lines.length) {
+    if (!lines[i].trim()) {
+      i++;
+      continue;
+    }
+    const blockStart = i;
+    // optional id line
+    if (!lines[i].includes("-->") && i + 1 < lines.length && lines[i + 1].includes("-->")) {
+      i++;
+    }
+    if (i >= lines.length || !lines[i].includes("-->")) {
+      i++;
+      continue;
+    }
+    const timing = lines[i];
+    i++;
+    while (i < lines.length && lines[i].trim() !== "") i++;
+    const block = lines.slice(blockStart, i).join("\n");
+    const arrow = timing.indexOf("-->");
+    const start = parseTimestamp(timing.slice(0, arrow).trim());
+    const end = parseTimestamp(timing.slice(arrow + 3).trim().split(/\s/)[0]);
+    const bytes = Buffer.byteLength(block, "utf8");
+    cues.push({ block, start, end, bytes });
+  }
+  return cues;
+}
+
+/**
+ * Split a large WebVTT into multiple files each ≤ maxBytes (cue-aligned).
+ * Absolute cue times kept so each file is a valid timeline slice for HLS.
+ * Returns { files: [{name,fullPath,size}], playlistText }.
+ */
+function packVttIntoSizedFiles(vttContent, subIndex, outputDir, maxBytes = ZIP_PAYLOAD_BUDGET) {
+  const cues = parseVttCueBlocks(vttContent);
+  if (cues.length === 0) {
+    const name = `subtitle_${subIndex}_00000.vtt`;
+    const fullPath = path.join(outputDir, name);
+    const body = ensureVttTimestampMap(vttContent || "WEBVTT\n\n");
+    fs.writeFileSync(fullPath, body, "utf8");
+    const size = fs.statSync(fullPath).size;
+    const duration = 1;
+    return {
+      files: [{ name, fullPath, size }],
+      playlistText: buildSingleSegmentVttPlaylist(duration, name),
+    };
+  }
+
+  const header = "WEBVTT\nX-TIMESTAMP-MAP=LOCAL:00:00:00.000,MPEGTS:0\n\n";
+  const headerBytes = Buffer.byteLength(header, "utf8");
+  const parts = [];
+  let current = [];
+  let currentBytes = headerBytes;
+  let partStart = cues[0].start;
+  let partEnd = cues[0].end;
+
+  const flush = () => {
+    if (current.length === 0) return;
+    const idx = parts.length;
+    const name = `subtitle_${subIndex}_${String(idx).padStart(5, "0")}.vtt`;
+    const fullPath = path.join(outputDir, name);
+    const body = header + current.map((c) => c.block).join("\n\n") + "\n";
+    fs.writeFileSync(fullPath, body, "utf8");
+    const size = fs.statSync(fullPath).size;
+    parts.push({
+      name,
+      fullPath,
+      size,
+      duration: Math.max(0.001, partEnd - partStart),
+    });
+    current = [];
+    currentBytes = headerBytes;
+  };
+
+  for (const cue of cues) {
+    const add = cue.bytes + 2; // blank line between cues
+    // Single cue larger than budget: still its own file (assert later).
+    if (current.length > 0 && currentBytes + add > maxBytes) {
+      flush();
+      partStart = cue.start;
+      partEnd = cue.end;
+    }
+    if (current.length === 0) {
+      partStart = cue.start;
+      partEnd = cue.end;
+    } else {
+      partEnd = Math.max(partEnd, cue.end);
+    }
+    current.push(cue);
+    currentBytes += add;
+  }
+  flush();
+
+  let playlistText =
+    `#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:${Math.ceil(Math.max(...parts.map((p) => p.duration), 1))}\n` +
+    `#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-INDEPENDENT-SEGMENTS\n`;
+  for (const p of parts) {
+    playlistText += `#EXTINF:${p.duration.toFixed(6)},\n${p.name}\n`;
+  }
+  playlistText += "#EXT-X-ENDLIST\n";
+
+  return {
+    files: parts.map(({ name, fullPath, size }) => ({ name, fullPath, size })),
+    playlistText,
+  };
+}
+
+/**
+ * Split a binary file into ≤ maxBytes parts: baseName.part0000, .part0001, ...
+ */
+async function splitBinaryIntoParts(srcPath, destDir, baseName, maxBytes = ZIP_PAYLOAD_BUDGET) {
+  const stat = await fs.promises.stat(srcPath);
+  const total = stat.size;
+  if (total <= maxBytes) {
+    return [{ name: baseName, fullPath: srcPath, size: total, partIndex: 0, isOriginal: true }];
+  }
+  const fd = await fs.promises.open(srcPath, "r");
+  const parts = [];
+  try {
+    let offset = 0;
+    let partIndex = 0;
+    while (offset < total) {
+      const len = Math.min(maxBytes, total - offset);
+      const buf = Buffer.alloc(len);
+      await fd.read(buf, 0, len, offset);
+      const name = `${baseName}.part${String(partIndex).padStart(4, "0")}`;
+      const fullPath = path.join(destDir, name);
+      await fs.promises.writeFile(fullPath, buf);
+      parts.push({ name, fullPath, size: len, partIndex, isOriginal: false });
+      offset += len;
+      partIndex++;
+    }
+  } finally {
+    await fd.close();
+  }
+  return parts;
+}
+
+/**
+ * Zip+upload subtitle payload files under MAX_ZIP_BYTES (multi-zip when needed).
+ * Returns array of completedSubtitleZips entries.
+ */
+async function uploadSubtitlePayloadZips({
+  streamIdx,
+  files,
+  workDir,
+  uploadFn,
+}) {
+  for (const f of files) {
+    assertUnderZipCap(f.size, `subtitle #${streamIdx} file ${f.name}`);
+  }
+  const batches = batchFilesBySize(files, ZIP_PAYLOAD_BUDGET);
+  const out = [];
+  for (let zipIndex = 0; zipIndex < batches.length; zipIndex++) {
+    const batch = batches[zipIndex];
+    const zipName =
+      zipIndex === 0
+        ? `subtitle_${streamIdx}.zip`
+        : `subtitle_${streamIdx}_${String(zipIndex).padStart(3, "0")}.zip`;
+    const zipPath = path.join(workDir, zipName);
+    const listFilePath = path.join(workDir, `${zipName}.list.txt`);
+    console.log(
+      `Packaging subtitle ZIP ${zipName} (${batch.length} file(s), stream #${streamIdx})...`,
+    );
+    const uploaded = await zipStoreUploadAndCleanup({
+      filePaths: batch.map((f) => f.fullPath),
+      zipName,
+      zipPath,
+      listFilePath,
+      uploadFn,
+    });
+    out.push({
+      zipType: "subtitle",
+      streamIndex: streamIdx,
+      zipIndex,
+      assetId: uploaded.assetId,
+      url: uploaded.url,
+      zipSize: uploaded.zipSize,
+    });
+  }
+  return out;
 }
 
 let globalProxyServer = null;
@@ -2490,10 +2758,10 @@ function shouldComputeSegmentTimeline(kind, { isSubtitlesJob = false, isThumbnai
   return kind !== 'original' && !isSubtitlesJob && !isThumbnailsJob;
 }
 
-// Storyboard scrub previews: single resolution, denser than the old 10s×160 JPEG grid.
-// 10×10 keeps ~100 tiles/sheet so ~25 min @ 5s ≈ 3 sheets without multi‑megapixel 16×16 sheets.
+// Storyboard scrub previews: 1s tiles @ 480px WebP q85.
+// 10×10 = 100 tiles/sheet ≈ 1m40s per sheet; multi-zip under MAX_ZIP_BYTES like video/audio.
 const THUMB_STORYBOARD = Object.freeze({
-  intervalSec: 5,
+  intervalSec: 1,
   tileWidth: 480,
   cols: 10,
   rows: 10,
@@ -3072,35 +3340,38 @@ async function main() {
             });
 
             const streamIdx = sub.index;
-            const zipName = `subtitle_${streamIdx}.zip`;
-            const zipPath = path.join(WORK_DIR, zipName);
-            console.log(`Packaging bitmap subtitle ZIP ${zipName}...`);
-            const listFilePath = path.join(WORK_DIR, `${zipName}.list.txt`);
-            await fs.promises.writeFile(listFilePath, subExtPath, 'utf8');
-
+            const baseEntry = `subtitle_${streamIdx}.${sub.format}`;
+            let partPaths = [];
             try {
-              execSync(`zip -0 -j "${zipPath}" -@ < "${listFilePath}"`, { stdio: 'ignore' });
-
-              const zipSize = (await fs.promises.stat(zipPath)).size;
-              console.log(`Uploading bitmap subtitle ZIP ${zipName} (${(zipSize / 1024).toFixed(1)} KB)...`);
-              const uploadRes = await uploadAssetWithRotation(zipName, zipPath, 'application/zip');
-
-              completedSubtitleZips.push({
-                zipType: 'subtitle',
-                streamIndex: streamIdx,
-                zipIndex: 0,
-                assetId: uploadRes.id,
-                url: uploadRes.browser_download_url,
-                zipSize
+              // Split oversize bitmap into .partNNNN files, multi-zip under 1 GiB.
+              // Serve concatenates parts when more than one zip/part exists.
+              const parts = await splitBinaryIntoParts(
+                subExtPath,
+                OUTPUT_DIR,
+                baseEntry,
+                ZIP_PAYLOAD_BUDGET,
+              );
+              partPaths = parts.filter((p) => !p.isOriginal).map((p) => p.fullPath);
+              if (parts.length > 1) {
+                console.log(
+                  `Bitmap subtitle #${streamIdx} is ${formatMiB(rawSize)} MiB — split into ${parts.length} part(s)`,
+                );
+              }
+              const uploaded = await uploadSubtitlePayloadZips({
+                streamIdx,
+                files: parts.map(({ name, fullPath, size }) => ({ name, fullPath, size })),
+                workDir: WORK_DIR,
+                uploadFn: uploadAssetWithRotation,
               });
-
-              fs.unlinkSync(zipPath);
+              completedSubtitleZips.push(...uploaded);
               await postPartialStreamCallback({ subtitles: [subtitlePlaylists[subtitlePlaylists.length - 1]] });
             } catch (zipErr) {
               console.warn(`Warning: Failed to zip/upload bitmap subtitle stream #${streamIdx}: ${zipErr.message}`);
             } finally {
-              try { fs.unlinkSync(listFilePath); } catch (e) {}
               try { fs.unlinkSync(subExtPath); } catch (e) {}
+              for (const p of partPaths) {
+                try { fs.unlinkSync(p); } catch (e) {}
+              }
             }
           } else {
             console.warn(`Warning: Extracted bitmap subtitle file not found for stream #${sub.index}`);
@@ -3129,10 +3400,37 @@ async function main() {
             const patchedVtt = ensureVttTimestampMap(fs.readFileSync(fullVttPath, 'utf8'));
             await fs.promises.writeFile(fullVttPath, patchedVtt, 'utf8');
             const rawSize = (await fs.promises.stat(fullVttPath)).size;
-            console.log(`Subtitle stream #${sub.index} converted to single VTT (${(rawSize / 1024).toFixed(1)} KB)`);
+            console.log(`Subtitle stream #${sub.index} converted to VTT (${formatMiB(rawSize)} MiB)`);
 
-            const rawSubPlaylist = buildSingleSegmentVttPlaylist(videoDurationVal, `subtitle_${sub.index}.vtt`);
+            const streamIdx = sub.index;
             const rewriteLabel = resolveManifestRewriteLabel(rawResolutions, codecs, activeLabel);
+            let filesToZip;
+            let rawSubPlaylist;
+            const splitFiles = [];
+
+            if (rawSize <= ZIP_PAYLOAD_BUDGET) {
+              // Small enough: one whole-file VTT + single-segment playlist (fast path).
+              const name = `subtitle_${streamIdx}.vtt`;
+              filesToZip = [{ name, fullPath: fullVttPath, size: rawSize }];
+              rawSubPlaylist = buildSingleSegmentVttPlaylist(videoDurationVal, name);
+            } else {
+              // Over 1 GiB budget: cue-aligned multi-file VTT + multi-segment playlist,
+              // then multi-zip under the same cap as video/audio.
+              console.log(
+                `Text subtitle #${streamIdx} is ${formatMiB(rawSize)} MiB — splitting under zip cap`,
+              );
+              const packed = packVttIntoSizedFiles(
+                patchedVtt,
+                streamIdx,
+                OUTPUT_DIR,
+                ZIP_PAYLOAD_BUDGET,
+              );
+              filesToZip = packed.files;
+              rawSubPlaylist = packed.playlistText;
+              for (const f of packed.files) splitFiles.push(f.fullPath);
+              try { fs.unlinkSync(fullVttPath); } catch (e) {}
+            }
+
             subtitlePlaylists.push({
               streamIndex: sub.index,
               language: sub.language,
@@ -3151,36 +3449,22 @@ async function main() {
               }) || rawSubPlaylist,
             });
 
-            // Zip and Upload this stream's single VTT file immediately
-            const streamIdx = sub.index;
-            const zipName = `subtitle_${streamIdx}.zip`;
-            const zipPath = path.join(WORK_DIR, zipName);
-            console.log(`Packaging subtitle ZIP ${zipName}...`);
-            const listFilePath = path.join(WORK_DIR, `${zipName}.list.txt`);
-            await fs.promises.writeFile(listFilePath, fullVttPath, 'utf8');
             try {
-              execSync(`zip -0 -j "${zipPath}" -@ < "${listFilePath}"`, { stdio: 'ignore' });
-
-              const zipSize = (await fs.promises.stat(zipPath)).size;
-              console.log(`Uploading subtitle ZIP ${zipName} (${(zipSize / 1024).toFixed(1)} KB)...`);
-              const uploadRes = await uploadAssetWithRotation(zipName, zipPath, 'application/zip');
-
-              completedSubtitleZips.push({
-                zipType: 'subtitle',
-                streamIndex: streamIdx,
-                zipIndex: 0,
-                assetId: uploadRes.id,
-                url: uploadRes.browser_download_url,
-                zipSize
+              const uploaded = await uploadSubtitlePayloadZips({
+                streamIdx,
+                files: filesToZip,
+                workDir: WORK_DIR,
+                uploadFn: uploadAssetWithRotation,
               });
-
-              fs.unlinkSync(zipPath);
+              completedSubtitleZips.push(...uploaded);
               await postPartialStreamCallback({ subtitles: [subtitlePlaylists[subtitlePlaylists.length - 1]] });
             } catch (zipErr) {
               console.warn(`Warning: Failed to zip/upload subtitle stream #${streamIdx}: ${zipErr.message}`);
             } finally {
-              try { fs.unlinkSync(listFilePath); } catch (e) {}
               try { fs.unlinkSync(fullVttPath); } catch (e) {}
+              for (const p of splitFiles) {
+                try { fs.unlinkSync(p); } catch (e) {}
+              }
             }
           } else {
             console.warn(`Warning: Extracted VTT file not found for stream #${sub.index}`);
@@ -3267,42 +3551,58 @@ async function main() {
           const vttPath = path.join(OUTPUT_DIR, 'thumbnails.vtt');
           await fs.promises.writeFile(vttPath, vtt, 'utf8');
 
-          // Zip the VTT + every sprite sheet together as a single asset, same
-          // zip-then-upload-then-cleanup shape as the subtitle ZIPs above.
-          const zipName = 'thumbnails.zip';
-          const zipPath = path.join(WORK_DIR, zipName);
-          const listFilePath = path.join(WORK_DIR, `${zipName}.list.txt`);
-          const filesForZip = [vttPath, ...spriteFiles.map(f => path.join(OUTPUT_DIR, f))];
-          await fs.promises.writeFile(listFilePath, filesForZip.join('\n'), 'utf8');
+          // Batch sheets under MAX_ZIP_BYTES (same helper as video/audio). VTT only
+          // in zip 0; serve uses DB vttText and multi-zip sprite lookup.
+          const spriteEntries = [];
+          for (const name of spriteFiles) {
+            const fullPath = path.join(OUTPUT_DIR, name);
+            const size = (await fs.promises.stat(fullPath)).size;
+            assertUnderZipCap(size, `thumbnail sheet ${name}`);
+            spriteEntries.push({ name, fullPath, size });
+          }
+          const vttSize = (await fs.promises.stat(vttPath)).size;
+          const batches = batchFilesBySize(spriteEntries);
+          console.log(
+            `Thumbnail storyboard: ${spriteEntries.length} sheet(s) in ${batches.length} zip(s) ` +
+            `(cap ${(MAX_ZIP_BYTES / 1024 / 1024).toFixed(0)} MiB; vtt ${(vttSize / 1024).toFixed(1)} KB)`,
+          );
 
           try {
-            execSync(`zip -0 -j "${zipPath}" -@ < "${listFilePath}"`, { stdio: 'ignore' });
+            for (let zipIndex = 0; zipIndex < batches.length; zipIndex++) {
+              const batch = batches[zipIndex];
+              const zipName = zipIndex === 0 ? 'thumbnails.zip' : `thumbnails_${String(zipIndex).padStart(3, '0')}.zip`;
+              const zipPath = path.join(WORK_DIR, zipName);
+              const listFilePath = path.join(WORK_DIR, `${zipName}.list.txt`);
+              const filesForZip = zipIndex === 0
+                ? [vttPath, ...batch.map(f => f.fullPath)]
+                : batch.map(f => f.fullPath);
 
-            const zipSize = (await fs.promises.stat(zipPath)).size;
-            console.log(`Uploading thumbnail ZIP ${zipName} (${(zipSize / 1024).toFixed(1)} KB)...`);
-            const uploadRes = await uploadAssetWithRotation(zipName, zipPath, 'application/zip');
+              try {
+                const uploaded = await zipStoreUploadAndCleanup({
+                  filePaths: filesForZip,
+                  zipName,
+                  zipPath,
+                  listFilePath,
+                  uploadFn: uploadAssetWithRotation,
+                });
 
-            completedSubtitleZips.push({
-              zipType: 'thumbnail',
-              streamIndex: 0,
-              zipIndex: 0,
-              assetId: uploadRes.id,
-              url: uploadRes.browser_download_url,
-              zipSize,
-              // Sent alongside the zip so the backend can serve/rewrite it (e.g. append
-              // ?pwd= for password-protected shares) without a round-trip zip fetch of
-              // its own - we already have it in memory right here.
-              vttText: vtt
-            });
-
-            fs.unlinkSync(zipPath);
-          } catch (zipErr) {
-            console.warn(`Warning: Failed to zip/upload thumbnail sprite sheet: ${zipErr.message}`);
+                completedSubtitleZips.push({
+                  zipType: 'thumbnail',
+                  streamIndex: 0,
+                  zipIndex,
+                  assetId: uploaded.assetId,
+                  url: uploaded.url,
+                  zipSize: uploaded.zipSize,
+                  vttText: zipIndex === 0 ? vtt : null,
+                });
+              } catch (zipErr) {
+                console.warn(`Warning: Failed to zip/upload thumbnail ZIP ${zipName}: ${zipErr.message}`);
+              }
+            }
           } finally {
-            try { fs.unlinkSync(listFilePath); } catch (e) {}
             try { fs.unlinkSync(vttPath); } catch (e) {}
-            for (const f of spriteFiles) {
-              try { fs.unlinkSync(path.join(OUTPUT_DIR, f)); } catch (e) {}
+            for (const f of spriteEntries) {
+              try { fs.unlinkSync(f.fullPath); } catch (e) {}
             }
           }
         } else {
@@ -3557,63 +3857,50 @@ async function main() {
           return (a.segmentIndex ?? -1) - (b.segmentIndex ?? -1);
         });
 
-        let pendingFiles = [];
-        let pendingSize = 0;
-        let segmentStart = null;
-        let segmentEnd = null;
         let chunkIdx = 0;
 
-        const flush = async () => {
-          if (pendingFiles.length === 0) return;
+        // Batch under MAX_ZIP_BYTES; each batch is assert-capped on upload.
+        for (const f of trackFiles) {
+          assertUnderZipCap(f.size, `audio segment ${f.name}`);
+        }
+        const audioBatches = batchFilesBySize(trackFiles);
+        for (const batch of audioBatches) {
+          let batchSegStart = null;
+          let batchSegEnd = null;
+          for (const f of batch) {
+            if (f.segmentIndex !== null) {
+              if (batchSegStart === null || f.segmentIndex < batchSegStart) batchSegStart = f.segmentIndex;
+              if (batchSegEnd === null || f.segmentIndex > batchSegEnd) batchSegEnd = f.segmentIndex;
+            }
+          }
           const zipName = `audio-${streamIdx}-part${partIndex.toString().padStart(4, '0')}-${chunkIdx.toString().padStart(4, '0')}.zip`;
           const zipPath = path.join(WORK_DIR, zipName);
-          console.log(`Packaging audio ZIP ${zipName} with ${pendingFiles.length} files...`);
           const listFilePath = path.join(WORK_DIR, `${zipName}.list.txt`);
-          await fs.promises.writeFile(listFilePath, pendingFiles.map(f => f.fullPath).join('\n'), 'utf8');
-          try {
-            execSync(`zip -0 -j "${zipPath}" -@ < "${listFilePath}"`, { stdio: 'ignore' });
-          } finally {
-            try { fs.unlinkSync(listFilePath); } catch (e) {}
-          }
-
-          const zipSize = (await fs.promises.stat(zipPath)).size;
-          console.log(`Uploading audio ZIP ${zipName} (${(zipSize / 1024 / 1024).toFixed(2)} MB)...`);
-          const uploadRes = await uploadAssetWithRotation(zipName, zipPath, 'application/zip');
+          console.log(`Packaging audio ZIP ${zipName} with ${batch.length} files...`);
+          const uploaded = await zipStoreUploadAndCleanup({
+            filePaths: batch.map(f => f.fullPath),
+            zipName,
+            zipPath,
+            listFilePath,
+            uploadFn: uploadAssetWithRotation,
+          });
 
           completedSubtitleZips.push({
             zipType: 'audio',
             streamIndex: streamIdx,
             zipIndex: uniquePartZipIndex(partIndex, chunkIdx),
-            assetId: uploadRes.id,
-            url: uploadRes.browser_download_url,
-            zipSize,
-            segmentStart,
-            segmentEnd
+            assetId: uploaded.assetId,
+            url: uploaded.url,
+            zipSize: uploaded.zipSize,
+            segmentStart: batchSegStart,
+            segmentEnd: batchSegEnd,
           });
 
-          fs.unlinkSync(zipPath);
-          for (const f of pendingFiles) {
+          for (const f of batch) {
             try { fs.unlinkSync(f.fullPath); } catch (e) {}
           }
-          pendingFiles = [];
-          pendingSize = 0;
-          segmentStart = null;
-          segmentEnd = null;
           chunkIdx++;
-        };
-
-        for (const f of trackFiles) {
-          if (pendingSize + f.size > MAX_ZIP_BYTES && pendingFiles.length > 0) {
-            await flush();
-          }
-          pendingFiles.push(f);
-          pendingSize += f.size;
-          if (f.segmentIndex !== null) {
-            if (segmentStart === null || f.segmentIndex < segmentStart) segmentStart = f.segmentIndex;
-            if (segmentEnd === null || f.segmentIndex > segmentEnd) segmentEnd = f.segmentIndex;
-          }
         }
-        await flush();
         // Rewrite BEFORE partial callback. totalParts=1 merge can finalize from this
         // payload alone; bare relative names then resolve next to .../audio/N/ and 404.
         const rewriteLabel = resolveManifestRewriteLabel(rawResolutions, codecs, activeLabel);
@@ -3916,72 +4203,53 @@ async function main() {
     });
 
     const completedZipsForCodec = [];
-    let currentZipSize = 0;
     let currentZipIndex = 0;
-    let pendingFiles = [];
-    let segmentStart = null;
-    let segmentEnd = null;
 
-    async function uploadZipBatch() {
-      if (pendingFiles.length === 0) return;
-      
+    // Cap each segment; batch under MAX_ZIP_BYTES; assert zip size on upload.
+    for (const file of filesToZip) {
+      assertUnderZipCap(file.size, `video segment ${file.name}`);
+    }
+    const videoBatches = batchFilesBySize(filesToZip);
+    for (const batch of videoBatches) {
+      let batchSegStart = null;
+      let batchSegEnd = null;
+      for (const file of batch) {
+        if (file.segmentIndex !== null) {
+          if (batchSegStart === null || file.segmentIndex < batchSegStart) batchSegStart = file.segmentIndex;
+          if (batchSegEnd === null || file.segmentIndex > batchSegEnd) batchSegEnd = file.segmentIndex;
+        }
+      }
       const uniqueZipIndex = uniquePartZipIndex(partIndex, currentZipIndex);
       const zipName = `segments-${label}-${codec}-part${partIndex.toString().padStart(4, '0')}-${currentZipIndex.toString().padStart(4, '0')}.zip`;
       const zipPath = path.join(WORK_DIR, zipName);
-      
-      console.log(`Packaging ZIP ${zipName} with ${pendingFiles.length} segments...`);
       const listFilePath = path.join(WORK_DIR, `${zipName}.list.txt`);
-      const fileContents = pendingFiles.map(f => f.fullPath).join('\n');
-      await fs.promises.writeFile(listFilePath, fileContents, 'utf8');
-      try {
-        execSync(`zip -0 -j "${zipPath}" -@ < "${listFilePath}"`, { stdio: 'ignore' });
-      } finally {
-        try { fs.unlinkSync(listFilePath); } catch (e) {}
-      }
-      
-      const zipSize = (await fs.promises.stat(zipPath)).size;
-      console.log(`Uploading ${zipName} (${(zipSize / 1024 / 1024).toFixed(1)} MB)...`);
-      const uploadRes = await uploadAssetWithRotation(zipName, zipPath, 'application/zip');
-      
+      console.log(`Packaging ZIP ${zipName} with ${batch.length} segments...`);
+      const uploaded = await zipStoreUploadAndCleanup({
+        filePaths: batch.map(f => f.fullPath),
+        zipName,
+        zipPath,
+        listFilePath,
+        uploadFn: uploadAssetWithRotation,
+      });
+
       completedZipsForCodec.push({
         zipIndex: uniqueZipIndex,
-        assetId: uploadRes.id,
-        url: uploadRes.browser_download_url,
-        zipSize,
-        segmentStart,
-        segmentEnd
+        assetId: uploaded.assetId,
+        url: uploaded.url,
+        zipSize: uploaded.zipSize,
+        segmentStart: batchSegStart,
+        segmentEnd: batchSegEnd,
       });
-      
-      fs.unlinkSync(zipPath);
-      for (const f of pendingFiles) {
+
+      for (const f of batch) {
         const name = f.name;
         const isAudioOrSub = name.startsWith('audio_') || name.startsWith('subtitle_');
         if (!isAudioOrSub) {
           try { fs.unlinkSync(f.fullPath); } catch (e) {}
         }
       }
-      
       currentZipIndex++;
-      currentZipSize = 0;
-      pendingFiles = [];
-      segmentStart = null;
-      segmentEnd = null;
     }
-
-    for (const file of filesToZip) {
-      if (file.segmentIndex !== null) {
-        if (segmentStart === null || file.segmentIndex < segmentStart) segmentStart = file.segmentIndex;
-        if (segmentEnd === null || file.segmentIndex > segmentEnd) segmentEnd = file.segmentIndex;
-      }
-      
-      pendingFiles.push(file);
-      currentZipSize += file.size;
-      
-      if (currentZipSize >= MAX_ZIP_BYTES) {
-        await uploadZipBatch();
-      }
-    }
-    await uploadZipBatch();
 
     // Compute measuredBandwidth
     let measuredBandwidth = 0;
@@ -4340,5 +4608,11 @@ if (require.main === module) {
     mapPool,
     FIELD_PROBE_CONCURRENCY,
     uniquePartZipIndex,
+    MAX_ZIP_BYTES,
+    ZIP_PAYLOAD_BUDGET,
+    assertUnderZipCap,
+    batchFilesBySize,
+    packVttIntoSizedFiles,
+    parseVttCueBlocks,
   };
 }
