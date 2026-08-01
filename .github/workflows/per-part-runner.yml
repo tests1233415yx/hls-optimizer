@@ -96,6 +96,7 @@ jobs:
           node optimize.js
           echo "field_plan_json<<EOF" >> "$GITHUB_OUTPUT"
           cat "$FIELD_DETECT_OUTPUT_PATH" >> "$GITHUB_OUTPUT"
+          echo "" >> "$GITHUB_OUTPUT"
           echo "EOF" >> "$GITHUB_OUTPUT"
       - name: Cleanup work directory
         if: always()
