@@ -1343,53 +1343,84 @@ function recordAccess(assetIdx) {
   chunkAccessOrder.push(assetIdx);
 }
 
-function cleanCache() {
+// Extra free space kept beyond the cached chunks themselves, so a slow eviction
+// or a neighboring process (ffmpeg output, other work dirs) still leaves headroom.
+const CACHE_DISK_SAFETY_BYTES = 2 * 1024 * 1024 * 1024;
+
+function getFreeDiskBytes(dir) {
+  try {
+    const stats = fs.statfsSync(dir);
+    return stats.bavail * stats.bsize;
+  } catch (e) {
+    return Infinity; // statfs unsupported/failed: don't block on it
+  }
+}
+
+function deleteChunk(assetIdx) {
+  const oldPath = path.join(cacheDir, `part_${assetIdx}`);
+  if (!fs.existsSync(oldPath)) return false;
+  console.error(`[Proxy Cache] Deleting old cached chunk ${assetIdx} to free up space`);
+  try {
+    fs.unlinkSync(oldPath);
+    partRanges.delete(assetIdx);
+    return true;
+  } catch (e) {
+    console.warn(`[Proxy Cache] Failed to delete chunk ${assetIdx}:`, e);
+    return false;
+  }
+}
+
+// Evicts cached chunks that aren't currently being downloaded/read. Always
+// enforces the MAX_CACHED_CHUNKS count cap; if neededBytes is given, keeps
+// evicting (even below the count cap) until there's real free disk space for
+// the incoming write, since the count cap alone can't see actual disk pressure
+// from other jobs/dirs sharing the same volume.
+async function cleanCache(neededBytes = 0) {
   if (!fs.existsSync(cacheDir)) return;
-  (async () => {
-    const files = (await fs.promises.readdir(cacheDir))
-      .filter(name => name.startsWith('part_') && !name.endsWith('.tmp'))
-      .map(name => parseInt(name.substring(5), 10))
-      .filter(num => !isNaN(num));
 
-    if (files.length <= MAX_CACHED_CHUNKS) return;
+  const files = (await fs.promises.readdir(cacheDir))
+    .filter(name => name.startsWith('part_'))
+    .map(name => parseInt(name.substring(5), 10))
+    .filter(num => !isNaN(num));
 
-    files.sort((a, b) => {
-      const idxA = chunkAccessOrder.indexOf(a);
-      const idxB = chunkAccessOrder.indexOf(b);
-      return idxA - idxB;
-    });
+  const isEvictable = (assetIdx) =>
+    !activeDownloads.has(assetIdx) && !(activeReads.get(assetIdx) > 0);
 
-    let deletedCount = 0;
-    const targetDeleteCount = files.length - MAX_CACHED_CHUNKS;
+  files.sort((a, b) => {
+    const idxA = chunkAccessOrder.indexOf(a);
+    const idxB = chunkAccessOrder.indexOf(b);
+    return idxA - idxB;
+  });
 
+  let deletedCount = 0;
+  const targetDeleteCount = files.length - MAX_CACHED_CHUNKS;
+  for (const assetIdx of files) {
+    if (deletedCount >= targetDeleteCount) break;
+    if (!isEvictable(assetIdx)) continue;
+    if (deleteChunk(assetIdx)) deletedCount++;
+  }
+
+  if (neededBytes > 0) {
     for (const assetIdx of files) {
-      if (deletedCount >= targetDeleteCount) break;
-      if (activeDownloads.has(assetIdx)) continue;
-      if (activeReads.has(assetIdx) && activeReads.get(assetIdx) > 0) continue;
-
-      const oldPath = path.join(cacheDir, `part_${assetIdx}`);
-      if (fs.existsSync(oldPath)) {
-        console.error(`[Proxy Cache] Deleting old cached chunk ${assetIdx} to free up space`);
-        try {
-          fs.unlinkSync(oldPath);
-          partRanges.delete(assetIdx);
-          deletedCount++;
-        } catch (e) {
-          console.warn(`[Proxy Cache] Failed to delete chunk ${assetIdx}:`, e);
-        }
-      }
+      if (getFreeDiskBytes(cacheDir) >= neededBytes + CACHE_DISK_SAFETY_BYTES) break;
+      if (!isEvictable(assetIdx)) continue;
+      deleteChunk(assetIdx);
     }
-  })();
+  }
 }
 
 // Ensures a sparse cache file exists for this part, sized to the full remote part
 // (so byte offsets line up), without pre-filling it — actual bytes are only written
 // for ranges that get downloaded.
-function ensurePartFile(assetIdx, partSize) {
-  cleanCache();
+async function ensurePartFile(assetIdx, partSize) {
+  await cleanCache(partSize);
   fs.mkdirSync(cacheDir, { recursive: true });
   const destPath = path.join(cacheDir, `part_${assetIdx}`);
   if (!fs.existsSync(destPath)) {
+    const free = getFreeDiskBytes(cacheDir);
+    if (free < partSize + CACHE_DISK_SAFETY_BYTES) {
+      throw new Error(`[Proxy Cache] Not enough disk space for chunk ${assetIdx}: need ${partSize} bytes (+${CACHE_DISK_SAFETY_BYTES} headroom), only ${free} free`);
+    }
     const fd = fs.openSync(destPath, 'w');
     fs.ftruncateSync(fd, partSize);
     fs.closeSync(fd);
@@ -1404,10 +1435,10 @@ function ensurePartFile(assetIdx, partSize) {
 function getOrDownloadRange(assetIdx, partAssets, token, start, end) {
   recordAccess(assetIdx);
   const partSize = partAssets[assetIdx].size;
-  const destPath = ensurePartFile(assetIdx, partSize);
 
   const prevTail = partQueue.get(assetIdx) || Promise.resolve();
   const task = prevTail.then(async () => {
+    const destPath = await ensurePartFile(assetIdx, partSize);
     const covered = partRanges.get(assetIdx) || [];
     const missing = findMissingRanges(covered, start, end);
 
@@ -1432,7 +1463,7 @@ function getOrDownloadRange(assetIdx, partAssets, token, start, end) {
   task.finally(() => {
     if (activeDownloads.get(assetIdx) === task) {
       activeDownloads.delete(assetIdx);
-      cleanCache();
+      cleanCache().catch(() => {});
     }
   }).catch(() => {});
 
