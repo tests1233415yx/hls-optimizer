@@ -8,7 +8,8 @@ jobs:
     outputs:
       kind: ${{ steps.parse.outputs.kind }}
       parts_json: ${{ steps.parse.outputs.parts_json }}
-      chunks_json: ${{ steps.parse.outputs.chunks_json }}
+      batches_json: ${{ steps.parse.outputs.batches_json }}
+      batch_indices: ${{ steps.parse.outputs.batch_indices }}
     steps:
       - name: Set up Node.js
         uses: actions/setup-node@v6
@@ -34,9 +35,17 @@ jobs:
               }
             }
 
+            // GitHub matrix strategy caps at 256 generated jobs; shard into batches under that limit.
+            const MAX_MATRIX_SIZE = 256;
+            const batches = [];
+            for (let i = 0; i < include.length; i += MAX_MATRIX_SIZE) {
+              batches.push({ include: include.slice(i, i + MAX_MATRIX_SIZE) });
+            }
+
             console.log(`kind=${payload.kind || ""}`);
             console.log(`parts_json=${JSON.stringify({ include: parts })}`);
-            console.log(`chunks_json=${JSON.stringify({ include })}`);
+            console.log(`batches_json=${JSON.stringify(batches)}`);
+            console.log(`batch_indices=${JSON.stringify(batches.map((_, i) => i))}`);
           ' >> "$GITHUB_OUTPUT"
 
   # Field strategy + scene-cut timeline are part-scoped, not resolution-scoped (see
@@ -135,7 +144,11 @@ jobs:
   optimize:
     needs: [setup, detect]
     if: always() && (needs.detect.result == 'success' || needs.detect.result == 'skipped')
+    strategy:
+      fail-fast: false
+      matrix:
+        batch: ${{ fromJson(needs.setup.outputs.batch_indices) }}
     uses: ./.github/workflows/optimize-runner.yml
     with:
-      matrix_json: ${{ needs.setup.outputs.chunks_json }}
+      matrix_json: ${{ toJson(fromJson(needs.setup.outputs.batches_json)[matrix.batch]) }}
     secrets: inherit

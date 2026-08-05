@@ -734,7 +734,10 @@ function computeBackoffMs(headers, fallbackMs) {
   if (remaining === '0' && reset) {
     const waitMs = (parseInt(reset, 10) * 1000) - Date.now() + 1000 + Math.random() * 2000;
     if (waitMs > fallbackMs) {
-      return Math.min(waitMs, 90000);
+      // ponytail: 90s cap was shorter than typical time-to-reset, so the retry loop gave up
+      // before the window actually reset (observed: reset 78-800s out, job died at attempt 5).
+      // Cap raised well past worst observed case; still bounded so a stuck job can't hang forever.
+      return Math.min(waitMs, 20 * 60 * 1000);
     }
   }
   return fallbackMs;
@@ -4145,7 +4148,10 @@ async function main() {
     ffmpegArgs.push(`"${playlistPath}"`);
     const ffmpegCmd = ffmpegArgs.flat().join(' ');
     console.log(`Executing FFmpeg command: ${ffmpegCmd}`);
-    await execAsync(ffmpegCmd, { stdio: 'inherit' });
+    // ponytail: encode uses all vCPUs by default and can starve the runner agent's own
+    // heartbeat, causing "lost communication with server" on small instances. Lower priority
+    // so the runner process still gets scheduled; upgrade to explicit -threads cap if this recurs.
+    await execAsync(`nice -n 10 ${ffmpegCmd}`, { stdio: 'inherit' });
 
     // Group segments and package ZIPs
     console.log(`Grouping segments and packaging ZIPs for ${codec}...`);
