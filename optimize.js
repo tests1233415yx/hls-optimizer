@@ -787,7 +787,6 @@ function downloadAsset(urlStr, token, destPath, maxRetries = 3) {
       let file = null;
       let activeRequest = null;
       let downloadedBytes = 0;
-      let totalBytes = 0;
       let isRejected = false;
 
       function cleanupAndReject(err) {
@@ -810,15 +809,7 @@ function downloadAsset(urlStr, token, destPath, maxRetries = 3) {
 
       function get(url) {
         const parsed = new URL(url);
-        const headers = {
-          'User-Agent': 'github-storage-worker/1.0.0',
-        };
-        // ONLY send Authorization & Accept headers if we are targeting GitHub endpoints.
-        // S3/CDN endpoints will reject requests that mix signature query parameters with Auth headers.
-        if (parsed.hostname.endsWith('github.com')) {
-          headers['Authorization'] = `Bearer ${token}`;
-          headers['Accept'] = 'application/octet-stream';
-        }
+        const headers = buildDownloadHeaders(parsed, token);
         
         file = fs.createWriteStream(destPath);
         file.on('error', (err) => {
@@ -837,7 +828,7 @@ function downloadAsset(urlStr, token, destPath, maxRetries = 3) {
             cleanupAndReject(err);
           });
 
-          if (res.statusCode === 302 || res.statusCode === 301) {
+          if (res.statusCode === 302 || res.statusCode === 301 || res.statusCode === 307 || res.statusCode === 308) {
             const loc = res.headers.location;
             res.resume(); // consume response body
             activeRequests.delete(req);
@@ -854,6 +845,9 @@ function downloadAsset(urlStr, token, destPath, maxRetries = 3) {
             res.resume();
             const err = new Error(`Failed to download asset, HTTP status: ${res.statusCode}`);
             err.headers = res.headers;
+            if (res.statusCode === 403 || res.statusCode === 401) {
+              cdnUrlCache.delete(urlStr);
+            }
             cleanupAndReject(err);
             return;
           }
@@ -889,7 +883,14 @@ function downloadAsset(urlStr, token, destPath, maxRetries = 3) {
           cleanupAndReject(err);
         });
       }
-      get(urlStr);
+
+      // Prefer cached CDN URL so full-file downloads also skip api.github.com after first resolve.
+      resolveAssetCdnUrl(urlStr, token)
+        .then((cdnUrl) => {
+          if (isRejected) return;
+          get(cdnUrl);
+        })
+        .catch((err) => cleanupAndReject(err));
     });
   }
 
@@ -1356,11 +1357,132 @@ function buildDownloadHeaders(parsed, token) {
   const headers = {
     'User-Agent': 'github-storage-worker/1.0.0',
   };
-  if (parsed.hostname.endsWith('github.com')) {
+  // ONLY send Authorization & Accept on github.com / api.github.com.
+  // CDN/S3 signed URLs reject Auth headers mixed with query signatures.
+  if (parsed.hostname === 'api.github.com' || parsed.hostname.endsWith('.github.com') || parsed.hostname === 'github.com') {
     headers['Authorization'] = `Bearer ${token}`;
     headers['Accept'] = 'application/octet-stream';
   }
   return headers;
+}
+
+// --- CDN URL cache ----------------------------------------------------------
+// Sparse range downloads used to hit api.github.com on EVERY range (auth + 302
+// + rate-limit counters). With field-detect windows and ffmpeg seeks that is
+// hundreds of API calls per job, which starves the shared token and can stall
+// a 20MB part for minutes waiting on X-RateLimit-Reset. Resolve the signed CDN
+// Location once per asset (like backend getResolvedAssetUrl) and reuse it for
+// all subsequent Range GETs until it expires.
+const CDN_URL_CACHE_TTL_MS = 12 * 60 * 1000;
+const cdnUrlCache = new Map(); // assetApiUrl -> { url, expiresAt }
+const pendingCdnResolutions = new Map(); // assetApiUrl -> Promise<string>
+
+function getS3UrlExpirationMs(urlStr) {
+  try {
+    const parsed = new URL(urlStr);
+    const amzDate = parsed.searchParams.get('X-Amz-Date');
+    const amzExpires = parsed.searchParams.get('X-Amz-Expires');
+    if (amzDate && amzExpires) {
+      const year = parseInt(amzDate.substring(0, 4), 10);
+      const month = parseInt(amzDate.substring(4, 6), 10) - 1;
+      const day = parseInt(amzDate.substring(6, 8), 10);
+      const hour = parseInt(amzDate.substring(9, 11), 10);
+      const minute = parseInt(amzDate.substring(11, 13), 10);
+      const second = parseInt(amzDate.substring(13, 15), 10);
+      return Date.UTC(year, month, day, hour, minute, second) + parseInt(amzExpires, 10) * 1000;
+    }
+    const exp = parsed.searchParams.get('expires');
+    if (exp) {
+      const n = parseInt(exp, 10);
+      if (Number.isFinite(n)) return n * 1000;
+    }
+  } catch (_) {}
+  return null;
+}
+
+function isGithubAssetApiHost(hostname) {
+  return hostname === 'api.github.com' || hostname === 'github.com' || hostname.endsWith('.github.com');
+}
+
+/**
+ * Resolve a GitHub release-asset API URL to a direct CDN/S3 URL and cache it.
+ * Non-GitHub URLs are returned as-is. Concurrent resolvers for the same URL share one request.
+ */
+function resolveAssetCdnUrl(assetUrl, token) {
+  if (!assetUrl) return Promise.reject(new Error('resolveAssetCdnUrl: empty url'));
+
+  let parsed;
+  try {
+    parsed = new URL(assetUrl);
+  } catch (e) {
+    return Promise.reject(e);
+  }
+
+  // Already a CDN/S3 URL (or anything outside github.com) — no resolution needed.
+  if (!isGithubAssetApiHost(parsed.hostname)) {
+    return Promise.resolve(assetUrl);
+  }
+
+  const cached = cdnUrlCache.get(assetUrl);
+  // 30s safety buffer so we never hand out a URL that expires mid-transfer.
+  if (cached && cached.expiresAt > Date.now() + 30000) {
+    return Promise.resolve(cached.url);
+  }
+
+  const pending = pendingCdnResolutions.get(assetUrl);
+  if (pending) return pending;
+
+  const promise = new Promise((resolve, reject) => {
+    const headers = buildDownloadHeaders(parsed, token);
+    const req = https.get({
+      protocol: parsed.protocol,
+      hostname: parsed.hostname,
+      port: parsed.port,
+      path: parsed.pathname + parsed.search,
+      headers,
+      timeout: 30000,
+    }, (res) => {
+      const loc = res.headers.location;
+      // Drain/abort body; we only care about the redirect Location.
+      res.resume();
+
+      if (res.statusCode === 301 || res.statusCode === 302 || res.statusCode === 307 || res.statusCode === 308) {
+        if (!loc) {
+          reject(new Error(`CDN resolve redirect missing Location (status ${res.statusCode})`));
+          return;
+        }
+        const s3Exp = getS3UrlExpirationMs(loc);
+        const expiresAt = s3Exp ? s3Exp - 30000 : Date.now() + CDN_URL_CACHE_TTL_MS;
+        cdnUrlCache.set(assetUrl, { url: loc, expiresAt });
+        console.error(`[CDN Cache] RESOLVED asset URL (cached until ${new Date(expiresAt).toISOString()})`);
+        resolve(loc);
+        return;
+      }
+
+      if (res.statusCode && res.statusCode >= 400) {
+        const err = new Error(`CDN resolve failed: status ${res.statusCode}`);
+        err.headers = res.headers;
+        // Drop any stale cache entry so the next attempt re-resolves.
+        cdnUrlCache.delete(assetUrl);
+        reject(err);
+        return;
+      }
+
+      // Unexpected non-redirect success: fall back to the original URL.
+      resolve(assetUrl);
+    });
+
+    req.on('timeout', () => {
+      req.destroy();
+      reject(new Error('CDN resolve timed out'));
+    });
+    req.on('error', reject);
+  }).finally(() => {
+    pendingCdnResolutions.delete(assetUrl);
+  });
+
+  pendingCdnResolutions.set(assetUrl, promise);
+  return promise;
 }
 
 function attemptRangeDownload(url, destPath, token, start, end) {
@@ -1389,13 +1511,21 @@ function attemptRangeDownload(url, destPath, token, start, end) {
     function handleResponse(req, res) {
       res.on('error', (err) => cleanupAndReject(err));
 
-      if (res.statusCode === 302 || res.statusCode === 301) {
+      if (res.statusCode === 302 || res.statusCode === 301 || res.statusCode === 307 || res.statusCode === 308) {
         const loc = res.headers.location;
         res.resume();
         activeRequests.delete(req);
         if (!loc) {
           cleanupAndReject(new Error('Redirect location missing'));
           return;
+        }
+        // Cache unexpected mid-download redirects so the next range skips the hop.
+        if (isGithubAssetApiHost(new URL(url).hostname)) {
+          const s3Exp = getS3UrlExpirationMs(loc);
+          cdnUrlCache.set(url, {
+            url: loc,
+            expiresAt: s3Exp ? s3Exp - 30000 : Date.now() + CDN_URL_CACHE_TTL_MS,
+          });
         }
         startDownload(loc);
         return;
@@ -1405,6 +1535,10 @@ function attemptRangeDownload(url, destPath, token, start, end) {
         res.resume();
         const err = new Error(`Failed range download: status ${res.statusCode}`);
         err.headers = res.headers;
+        // 403 on a signed CDN URL usually means expiry — drop cache so retry re-resolves.
+        if (res.statusCode === 403 || res.statusCode === 401) {
+          cdnUrlCache.delete(url);
+        }
         cleanupAndReject(err);
         return;
       }
@@ -1473,13 +1607,6 @@ function attemptRangeDownload(url, destPath, token, start, end) {
       const headers = buildDownloadHeaders(parsed, token);
       headers['Range'] = `bytes=${start}-${end}`;
 
-      try {
-        fd = fs.openSync(destPath, 'r+');
-      } catch (e) {
-        cleanupAndReject(e);
-        return;
-      }
-
       const req = https.get({
         protocol: parsed.protocol,
         hostname: parsed.hostname,
@@ -1501,7 +1628,21 @@ function attemptRangeDownload(url, destPath, token, start, end) {
       });
     }
 
-    startDownload(url);
+    try {
+      // Open the sparse cache file once; redirects must not re-open (fd leak).
+      fd = fs.openSync(destPath, 'r+');
+    } catch (e) {
+      cleanupAndReject(e);
+      return;
+    }
+
+    // Resolve api.github.com → CDN once, then Range-GET the signed URL directly.
+    resolveAssetCdnUrl(url, token)
+      .then((cdnUrl) => {
+        if (isRejected) return;
+        startDownload(cdnUrl);
+      })
+      .catch((err) => cleanupAndReject(err));
   });
 }
 
@@ -3051,7 +3192,20 @@ async function main() {
     process.exit(1);
   }
 
-  // 3. Start local HTTP proxy with caching
+  // 3. Resolve signed CDN URLs once up front so the first probe/seek doesn't pay
+  // api.github.com latency (and so concurrent range fetches share one resolve).
+  console.log(`Pre-resolving CDN URLs for ${partAssets.length} source asset(s)...`);
+  const prewarmStart = Date.now();
+  await Promise.all(
+    partAssets.map((a) =>
+      resolveAssetCdnUrl(a.url, token).catch((e) => {
+        console.warn(`[CDN Cache] Prewarm failed for ${a.name}: ${e.message}`);
+      }),
+    ),
+  );
+  console.log(`CDN prewarm done in ${Date.now() - prewarmStart}ms`);
+
+  // 4. Start local HTTP proxy with caching
   console.log(`Starting local caching HTTP proxy server for ${partAssets.length} remote chunks...`);
   const proxyInfo = await startCachingProxy(partAssets, token);
   globalProxyServer = proxyInfo.server;
