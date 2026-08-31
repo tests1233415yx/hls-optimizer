@@ -1234,9 +1234,31 @@ function gitlabReleaseTag(releaseId) {
   return `release-${releaseId}`;
 }
 
-/** Same shape as the VPS's generateReleaseId(). */
+let lastMintedMs = 0;
+let mintedSeq = 0;
+
+/**
+ * Same shape as the VPS's generateReleaseId(): Date.now()*1000 + sequence.
+ *
+ * A per-millisecond counter rather than a random draw, for the same reason the
+ * VPS uses one - release rotation can mint several ids inside one millisecond,
+ * and two colliding ids would make the second create fail as "already taken".
+ * Unlike the VPS this never adopts a colliding release: it throws, so a
+ * collision costs a job rather than silently sharing storage between files.
+ */
 function gitlabMintReleaseId() {
-  return Date.now() * 1000 + Math.floor(Math.random() * 1000);
+  const now = Date.now();
+  if (now > lastMintedMs) {
+    lastMintedMs = now;
+    mintedSeq = 0;
+  } else {
+    mintedSeq++;
+    if (mintedSeq > 999) {
+      lastMintedMs += 1;
+      mintedSeq = 0;
+    }
+  }
+  return lastMintedMs * 1000 + mintedSeq;
 }
 
 function gitlabHeaders(extra = {}) {
