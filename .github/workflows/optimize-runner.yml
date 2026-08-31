@@ -94,6 +94,9 @@ jobs:
           ACTIVE_RESOLUTION_LABEL: ${{ matrix.resolution.label }}
           ACTIVE_PART: ${{ toJson(matrix.part) }}
           PRIVATE_REPO_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          # Only needed when a job targets a GitLab-primary file; the worker
+          # fails loudly rather than silently using the GitHub token instead.
+          GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
         run: |
           node optimize.js
       - name: Cleanup work directory

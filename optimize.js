@@ -391,9 +391,72 @@ const WORK_DIR = process.env.HLS_WORK_DIR
       : `/tmp/hls-worker-${process.pid}`);
 const INPUT_FILE = path.join(WORK_DIR, 'input.txt');
 const OUTPUT_DIR = path.join(WORK_DIR, 'hls-output');
-const MAX_ZIP_BYTES = 1024 * 1024 * 1024; // 1 GiB hard cap for every zip upload
+/**
+ * Storage backend this job reads from and writes to.
+ *
+ * The VPS sends non-secret coordinates in client_payload.data.storage; tokens
+ * come from this repo's own secrets, never from the payload (a dispatch payload
+ * is visible in the Actions run).
+ *
+ * Defaults to GitHub so a payload from an older VPS - which has no storage
+ * block - behaves exactly as before.
+ */
+const STORAGE = {
+  kind: 'github',
+  /** 1 GiB on GitHub; GitLab caps release assets at ~95 MiB. */
+  maxAssetBytes: 1024 * 1024 * 1024,
+  owner: null,
+  repo: null,
+  apiBase: null,
+  projectId: null,
+  token: null,
+};
+
+function configureStorage(cfg, githubToken) {
+  if (cfg && cfg.kind === 'gitlab') {
+    STORAGE.kind = 'gitlab';
+    STORAGE.apiBase = cfg.api_base || cfg.apiBase;
+    STORAGE.projectId = String(cfg.project_id || cfg.projectId);
+    STORAGE.token = process.env.GITLAB_TOKEN;
+    if (!STORAGE.token) {
+      throw new Error(
+        'Job targets GitLab but GITLAB_TOKEN is not set. Add it as a repository secret and pass it through in the workflow.',
+      );
+    }
+  } else {
+    STORAGE.kind = 'github';
+    STORAGE.token = githubToken;
+    if (cfg) {
+      STORAGE.owner = cfg.owner || null;
+      STORAGE.repo = cfg.repo || null;
+    }
+  }
+  // Always assign: STORAGE is module-global, so a conditional update would let
+  // a previous job's cap leak into this one.
+  const declared = cfg ? Number(cfg.max_asset_bytes ?? cfg.maxAssetBytes) : NaN;
+  STORAGE.maxAssetBytes = Number.isFinite(declared) && declared > 0
+    ? declared
+    : STORAGE.kind === 'gitlab'
+      ? 99614720 // GitLab default, mirrors the VPS registry
+      : 1024 * 1024 * 1024; // GitHub default
+  console.log(
+    `[Storage] backend=${STORAGE.kind} maxAssetBytes=${STORAGE.maxAssetBytes} (${(STORAGE.maxAssetBytes / 1024 / 1024).toFixed(0)} MiB zip cap)`,
+  );
+}
+
+/**
+ * Hard cap for every zip upload, taken from the backend's own asset limit
+ * rather than assumed. Sized wrong, a GitLab job builds 1 GiB zips that the
+ * API refuses outright.
+ */
+function maxZipBytes() {
+  return STORAGE.maxAssetBytes;
+}
+
 /** Leave headroom for zip local headers / EOCD so stored payload stays under the cap. */
-const ZIP_PAYLOAD_BUDGET = MAX_ZIP_BYTES - 512 * 1024;
+function zipPayloadBudget() {
+  return maxZipBytes() - 512 * 1024;
+}
 
 /**
  * Zip index unique across multi-part jobs for a single (zipType, streamIndex).
@@ -417,9 +480,9 @@ function formatMiB(bytes) {
  */
 function assertUnderZipCap(bytes, label) {
   const n = Number(bytes) || 0;
-  if (n > MAX_ZIP_BYTES) {
+  if (n > maxZipBytes()) {
     throw new Error(
-      `${label}: ${formatMiB(n)} MiB exceeds ${(MAX_ZIP_BYTES / 1024 / 1024).toFixed(0)} MiB zip cap`,
+      `${label}: ${formatMiB(n)} MiB exceeds ${(maxZipBytes() / 1024 / 1024).toFixed(0)} MiB zip cap`,
     );
   }
 }
@@ -429,7 +492,7 @@ function assertUnderZipCap(bytes, label) {
  * A single entry larger than maxBytes becomes its own batch (caller must
  * assertUnderZipCap that entry — cannot split format-blind).
  */
-function batchFilesBySize(files, maxBytes = MAX_ZIP_BYTES) {
+function batchFilesBySize(files, maxBytes = maxZipBytes()) {
   const batches = [];
   let pending = [];
   let pendingSize = 0;
@@ -523,7 +586,7 @@ function parseVttCueBlocks(vttContent) {
  * Absolute cue times kept so each file is a valid timeline slice for HLS.
  * Returns { files: [{name,fullPath,size}], playlistText }.
  */
-function packVttIntoSizedFiles(vttContent, subIndex, outputDir, maxBytes = ZIP_PAYLOAD_BUDGET) {
+function packVttIntoSizedFiles(vttContent, subIndex, outputDir, maxBytes = zipPayloadBudget()) {
   const cues = parseVttCueBlocks(vttContent);
   if (cues.length === 0) {
     const name = `subtitle_${subIndex}_00000.vtt`;
@@ -600,7 +663,7 @@ function packVttIntoSizedFiles(vttContent, subIndex, outputDir, maxBytes = ZIP_P
 /**
  * Split a binary file into ≤ maxBytes parts: baseName.part0000, .part0001, ...
  */
-async function splitBinaryIntoParts(srcPath, destDir, baseName, maxBytes = ZIP_PAYLOAD_BUDGET) {
+async function splitBinaryIntoParts(srcPath, destDir, baseName, maxBytes = zipPayloadBudget()) {
   const stat = await fs.promises.stat(srcPath);
   const total = stat.size;
   if (total <= maxBytes) {
@@ -641,7 +704,7 @@ async function uploadSubtitlePayloadZips({
   for (const f of files) {
     assertUnderZipCap(f.size, `subtitle #${streamIdx} file ${f.name}`);
   }
-  const batches = batchFilesBySize(files, ZIP_PAYLOAD_BUDGET);
+  const batches = batchFilesBySize(files, zipPayloadBudget());
   const out = [];
   for (let zipIndex = 0; zipIndex < batches.length; zipIndex++) {
     const batch = batches[zipIndex];
@@ -922,7 +985,17 @@ function downloadAsset(urlStr, token, destPath, maxRetries = 3) {
 }
 
 // Upload a single file as a release asset (with retries on transient connection issues)
-async function uploadAssetFile(uploadUrl, assetName, filePath, contentType, token) {
+/**
+ * Upload one asset. `releaseId` is required on GitLab, which has no upload_url
+ * and addresses the release by a tag derived from that id.
+ *
+ * Returns GitHub's response shape ({ id, browser_download_url, ... }) on both
+ * backends, so callers stay unchanged.
+ */
+async function uploadAssetFile(uploadUrl, assetName, filePath, contentType, token, releaseId) {
+  if (STORAGE.kind === 'gitlab') {
+    return uploadAssetFileGitlab(releaseId, assetName, filePath, contentType);
+  }
   const stat = await fs.promises.stat(filePath);
   const baseUploadUrl = uploadUrl.split('{')[0];
   const uploadEndpoint = `${baseUploadUrl}?name=${encodeURIComponent(assetName)}`;
@@ -1139,11 +1212,266 @@ function resolveManifestRewriteLabel(rawResolutions, codecs, jobLabel) {
   return useCodecSuffix ? `${baseLabel}_${primaryCodec}` : baseLabel;
 }
 
+/* ==========================================================================
+ * GitLab storage adapter
+ *
+ * GitLab's release model differs from GitHub's in three ways that matter here,
+ * and all three must match what the VPS (backend/src/services/gitlab.ts)
+ * expects - otherwise the server cannot read back what this worker writes:
+ *
+ *  1. Releases have no numeric id. The VPS mints one itself and derives the tag
+ *     as `release-${id}`, so the same derivation is used here.
+ *  2. Assets are release *links*, not first-class assets. Uploading is two
+ *     steps: multipart POST to /uploads, then attach the returned path as a
+ *     link on the release.
+ *  3. The link stores a *web* URL, which 403s for PRIVATE-TOKEN. Server-side
+ *     reads use an API URL derived from the upload path instead, so that is
+ *     what gets reported back as the asset url.
+ * ========================================================================== */
+
+/** Same derivation as the VPS: a release is addressed by this tag. */
+function gitlabReleaseTag(releaseId) {
+  return `release-${releaseId}`;
+}
+
+/** Same shape as the VPS's generateReleaseId(). */
+function gitlabMintReleaseId() {
+  return Date.now() * 1000 + Math.floor(Math.random() * 1000);
+}
+
+function gitlabHeaders(extra = {}) {
+  return { 'PRIVATE-TOKEN': STORAGE.token, ...extra };
+}
+
+function gitlabProjectUrl(suffix) {
+  return `${STORAGE.apiBase}/projects/${encodeURIComponent(STORAGE.projectId)}${suffix}`;
+}
+
+/**
+ * API-form download URL for an upload path, matching the VPS's
+ * toApiUploadDownloadUrl: the web form of the path rejects PRIVATE-TOKEN.
+ */
+function gitlabApiUploadUrl(fullPath) {
+  const m = String(fullPath).match(/\/uploads\/([0-9a-f]{32})\/(.+)$/i);
+  if (!m) return `${STORAGE.apiBase.replace(/\/api\/v4$/, '')}${fullPath}`;
+  return gitlabProjectUrl(`/uploads/${m[1]}/${encodeURIComponent(m[2])}`);
+}
+
+/**
+ * Two-step GitLab upload: multipart POST the file to the project, then attach
+ * the returned path to the release as a link.
+ *
+ * A name already taken is cleared first, so a retry cannot end up with two
+ * links of the same name pointing at different uploads - the server picks
+ * assets by name and would then read whichever came back first.
+ */
+async function uploadAssetFileGitlab(releaseId, assetName, filePath, contentType) {
+  if (!releaseId) {
+    throw new Error(`uploadAssetFileGitlab: missing releaseId for ${assetName}`);
+  }
+  const stat = await fs.promises.stat(filePath);
+  const maxAttempts = 3;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    console.log(
+      `[Upload] Uploading ${assetName} to GitLab (${formatMiB(stat.size)} MiB, attempt ${attempt}/${maxAttempts})...`,
+    );
+    try {
+      const uploaded = await gitlabPostUpload(filePath, assetName, contentType, stat.size);
+      const fullPath = uploaded.full_path || uploaded.url;
+      if (!fullPath) {
+        throw new Error('GitLab upload response missing full_path');
+      }
+
+      // Replace any link left by a previous attempt before creating this one.
+      try {
+        const existing = await gitlabListReleaseLinks(releaseId);
+        const dup = existing.find((l) => l && l.name === assetName);
+        if (dup) {
+          await apiRequest(
+            gitlabProjectUrl(
+              `/releases/${encodeURIComponent(gitlabReleaseTag(releaseId))}/assets/links/${dup.id}`,
+            ),
+            'DELETE',
+            gitlabHeaders(),
+          );
+        }
+      } catch (e) {
+        console.warn(`[Upload] Could not check existing links for ${assetName}: ${e.message}`);
+      }
+
+      const apiUrl = gitlabApiUploadUrl(fullPath);
+      const linkRes = await apiRequest(
+        gitlabProjectUrl(
+          `/releases/${encodeURIComponent(gitlabReleaseTag(releaseId))}/assets/links`,
+        ),
+        'POST',
+        gitlabHeaders({ 'Content-Type': 'application/json' }),
+        { name: assetName, url: apiUrl, link_type: 'other' },
+      );
+      const link = JSON.parse(linkRes.body.toString('utf8'));
+
+      // GitHub-shaped so callers need no branch. The API url is reported (not
+      // the web one) because that is what reads back with PRIVATE-TOKEN.
+      return {
+        id: link.id,
+        name: assetName,
+        size: stat.size,
+        browser_download_url: apiUrl,
+        url: apiUrl,
+        state: 'uploaded',
+      };
+    } catch (err) {
+      console.warn(`[Upload] GitLab upload of ${assetName} failed: ${err.message}`);
+      if (attempt >= maxAttempts) throw err;
+      await new Promise((r) => setTimeout(r, 2000 * attempt));
+    }
+  }
+}
+
+/** Multipart POST of one file to /projects/:id/uploads. */
+function gitlabPostUpload(filePath, assetName, contentType, contentLength) {
+  return new Promise((resolve, reject) => {
+    const boundary = `----VaultWorker${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
+    const safeName = String(assetName).replace(/["\r\n]/g, '_');
+    const preamble = Buffer.from(
+      `--${boundary}\r\n` +
+        `Content-Disposition: form-data; name="file"; filename="${safeName}"\r\n` +
+        `Content-Type: ${contentType || 'application/octet-stream'}\r\n\r\n`,
+    );
+    const epilogue = Buffer.from(`\r\n--${boundary}--\r\n`);
+    const target = new URL(gitlabProjectUrl('/uploads'));
+
+    let settled = false;
+    const settle = (fn) => {
+      if (!settled) {
+        settled = true;
+        fn();
+      }
+    };
+
+    const req = https.request(
+      {
+        method: 'POST',
+        hostname: target.hostname,
+        port: target.port || 443,
+        path: target.pathname + target.search,
+        headers: {
+          'PRIVATE-TOKEN': STORAGE.token,
+          'User-Agent': 'github-storage-worker/1.0.0',
+          'Content-Type': `multipart/form-data; boundary=${boundary}`,
+          'Content-Length': String(preamble.length + contentLength + epilogue.length),
+        },
+        timeout: 30 * 60 * 1000,
+      },
+      (res) => {
+        const chunks = [];
+        res.on('data', (c) => chunks.push(c));
+        res.on('end', () => {
+          const body = Buffer.concat(chunks).toString('utf8');
+          if (res.statusCode >= 200 && res.statusCode < 300) {
+            try {
+              settle(() => resolve(JSON.parse(body)));
+            } catch (e) {
+              settle(() => reject(new Error(`GitLab upload: bad JSON (${body.slice(0, 200)})`)));
+            }
+          } else {
+            settle(() =>
+              reject(new Error(`GitLab upload failed status=${res.statusCode} body=${body.slice(0, 300)}`)),
+            );
+          }
+        });
+      },
+    );
+
+    req.on('error', (err) => settle(() => reject(err)));
+    req.on('timeout', () => {
+      req.destroy(new Error('GitLab upload timed out'));
+    });
+
+    req.write(preamble);
+    const rs = fs.createReadStream(filePath);
+    rs.on('error', (err) => {
+      req.destroy(err);
+      settle(() => reject(err));
+    });
+    rs.on('end', () => {
+      req.write(epilogue);
+      req.end();
+    });
+    rs.pipe(req, { end: false });
+  });
+}
+
+/**
+ * One release's assets, in GitHub's asset shape on both backends.
+ *
+ * GitLab reports assets as release *links* with no size field, so size is left
+ * at 0 and discovered by the range reader (which learns it from Content-Range
+ * anyway). Normalising here keeps part filtering, range downloads and CDN
+ * prewarm backend-agnostic.
+ */
+async function fetchReleaseInfo(owner, repo, releaseId, token) {
+  if (STORAGE.kind === 'gitlab') {
+    const links = await gitlabListReleaseLinks(releaseId);
+    return {
+      upload_url: null,
+      assets: links.map((l) => ({
+        id: l.id,
+        name: l.name,
+        url: l.direct_asset_url || l.url,
+        browser_download_url: l.direct_asset_url || l.url,
+        size: 0,
+      })),
+    };
+  }
+  const res = await apiRequest(
+    `https://api.github.com/repos/${owner}/${repo}/releases/${releaseId}`,
+    'GET',
+    {
+      'Authorization': `Bearer ${token}`,
+      'Accept': 'application/vnd.github+json',
+    },
+  );
+  return JSON.parse(res.body.toString('utf8'));
+}
+
+async function gitlabListReleaseLinks(releaseId) {
+  const url = gitlabProjectUrl(
+    `/releases/${encodeURIComponent(gitlabReleaseTag(releaseId))}/assets/links`,
+  );
+  const res = await apiRequest(url, 'GET', gitlabHeaders());
+  const links = JSON.parse(res.body.toString('utf8'));
+  return Array.isArray(links) ? links : [];
+}
+
 async function createNewRelease(owner, repo, fileId, label, partIndex, token) {
-  const tagName = `hls-${fileId}-${label}-part${partIndex}-${Date.now()}`;
   const releaseName = `[HLS] File ${fileId} - ${label} (Part ${partIndex})`;
+
+  if (STORAGE.kind === 'gitlab') {
+    // The id is minted here and the tag derived from it, exactly as the VPS
+    // does - a GitLab release has no numeric id of its own, and the server
+    // finds this release again by that derived tag.
+    const releaseId = gitlabMintReleaseId();
+    await apiRequest(
+      gitlabProjectUrl('/releases'),
+      'POST',
+      gitlabHeaders({ 'Content-Type': 'application/json' }),
+      {
+        tag_name: gitlabReleaseTag(releaseId),
+        ref: 'main',
+        name: releaseName,
+        description: `Rotated HLS release for file ID: ${fileId}\nVariant: ${label}\nPart: ${partIndex}`,
+      },
+    );
+    // GitLab has no upload_url; uploads go to the project and are then linked,
+    // so the release id is all the upload path needs.
+    return { releaseId, uploadUrl: null };
+  }
+
+  const tagName = `hls-${fileId}-${label}-part${partIndex}-${Date.now()}`;
   const releaseUrl = `https://api.github.com/repos/${owner}/${repo}/releases`;
-  
+
   const res = await apiRequest(releaseUrl, 'POST', {
     'Authorization': `Bearer ${token}`,
     'Accept': 'application/vnd.github+json',
@@ -1163,6 +1491,9 @@ async function createNewRelease(owner, repo, fileId, label, partIndex, token) {
 }
 
 async function getReleaseAssetsCount(owner, repo, releaseId, token) {
+  if (STORAGE.kind === 'gitlab') {
+    return (await gitlabListReleaseLinks(releaseId)).length;
+  }
   const url = `https://api.github.com/repos/${owner}/${repo}/releases/${releaseId}`;
   const res = await apiRequest(url, 'GET', {
     'Authorization': `Bearer ${token}`,
@@ -1362,8 +1693,22 @@ function buildDownloadHeaders(parsed, token) {
   if (parsed.hostname === 'api.github.com' || parsed.hostname.endsWith('.github.com') || parsed.hostname === 'github.com') {
     headers['Authorization'] = `Bearer ${token}`;
     headers['Accept'] = 'application/octet-stream';
+  } else if (isGitlabApiHost(parsed.hostname)) {
+    // GitLab serves upload paths straight from the API host - no signed CDN
+    // redirect - so the range GET itself carries the token.
+    headers['PRIVATE-TOKEN'] = STORAGE.token;
   }
   return headers;
+}
+
+/** True when this host is the GitLab instance this job is configured against. */
+function isGitlabApiHost(hostname) {
+  if (STORAGE.kind !== 'gitlab' || !STORAGE.apiBase) return false;
+  try {
+    return new URL(STORAGE.apiBase).hostname === hostname;
+  } catch (_) {
+    return false;
+  }
 }
 
 // --- CDN URL cache ----------------------------------------------------------
@@ -3021,6 +3366,10 @@ async function main() {
   const vps_callback_url = vps ? vps.callback_url : flat_vps_callback_url;
   const vps_callback_token = vps ? vps.callback_token : flat_vps_callback_token;
 
+  // Which backend this job's releases live on, and the asset cap that sizes
+  // every zip. Must run before any storage call or zip batching below.
+  configureStorage(data.storage, token);
+
   let activePart = null;
   try {
     if (process.env.ACTIVE_PART) {
@@ -3117,22 +3466,9 @@ async function main() {
 
   // 2. Fetch Source Release Assets info
   const sourceReleaseId = source_release_id || release_id; // Fallback if source_release_id is not provided
-  const sourceReleaseUrl = `https://api.github.com/repos/${owner}/${repo}/releases/${sourceReleaseId}`;
-  console.log(`Fetching source release info...`);
-  const sourceReleaseRes = await apiRequest(sourceReleaseUrl, 'GET', {
-    'Authorization': `Bearer ${token}`,
-    'Accept': 'application/vnd.github+json',
-  });
-  const sourceReleaseInfo = JSON.parse(sourceReleaseRes.body.toString('utf8'));
-
-  // 2b. Fetch Target Release info for uploads
-  const targetReleaseUrl = `https://api.github.com/repos/${owner}/${repo}/releases/${release_id}`;
-  console.log(`Fetching target release info...`);
-  const targetReleaseRes = await apiRequest(targetReleaseUrl, 'GET', {
-    'Authorization': `Bearer ${token}`,
-    'Accept': 'application/vnd.github+json',
-  });
-  const targetReleaseInfo = JSON.parse(targetReleaseRes.body.toString('utf8'));
+  console.log(`Fetching source and target release info...`);
+  const sourceReleaseInfo = await fetchReleaseInfo(owner, repo, sourceReleaseId, token);
+  const targetReleaseInfo = await fetchReleaseInfo(owner, repo, release_id, token);
   const uploadUrl = targetReleaseInfo.upload_url;
 
   // Release rotation variables for handling large numbers of assets (>750)
@@ -3170,7 +3506,14 @@ async function main() {
       currentCount = 0;
     }
     
-    const res = await uploadAssetFile(currentUploadUrl, assetName, filePath, contentType, token);
+    const res = await uploadAssetFile(
+      currentUploadUrl,
+      assetName,
+      filePath,
+      contentType,
+      token,
+      currentReleaseId,
+    );
     assetsUploadedSinceCheck++;
     return res;
   }
@@ -3506,7 +3849,7 @@ async function main() {
                 subExtPath,
                 OUTPUT_DIR,
                 baseEntry,
-                ZIP_PAYLOAD_BUDGET,
+                zipPayloadBudget(),
               );
               partPaths = parts.filter((p) => !p.isOriginal).map((p) => p.fullPath);
               if (parts.length > 1) {
@@ -3565,7 +3908,7 @@ async function main() {
             let rawSubPlaylist;
             const splitFiles = [];
 
-            if (rawSize <= ZIP_PAYLOAD_BUDGET) {
+            if (rawSize <= zipPayloadBudget()) {
               // Small enough: one whole-file VTT + single-segment playlist (fast path).
               const name = `subtitle_${streamIdx}.vtt`;
               filesToZip = [{ name, fullPath: fullVttPath, size: rawSize }];
@@ -3580,7 +3923,7 @@ async function main() {
                 patchedVtt,
                 streamIdx,
                 OUTPUT_DIR,
-                ZIP_PAYLOAD_BUDGET,
+                zipPayloadBudget(),
               );
               filesToZip = packed.files;
               rawSubPlaylist = packed.playlistText;
@@ -3721,7 +4064,7 @@ async function main() {
           const batches = batchFilesBySize(spriteEntries);
           console.log(
             `Thumbnail storyboard: ${spriteEntries.length} sheet(s) in ${batches.length} zip(s) ` +
-            `(cap ${(MAX_ZIP_BYTES / 1024 / 1024).toFixed(0)} MiB; vtt ${(vttSize / 1024).toFixed(1)} KB)`,
+            `(cap ${(maxZipBytes() / 1024 / 1024).toFixed(0)} MiB; vtt ${(vttSize / 1024).toFixed(1)} KB)`,
           );
 
           try {
@@ -4768,8 +5111,10 @@ if (require.main === module) {
     mapPool,
     FIELD_PROBE_CONCURRENCY,
     uniquePartZipIndex,
-    MAX_ZIP_BYTES,
-    ZIP_PAYLOAD_BUDGET,
+    maxZipBytes,
+    zipPayloadBudget,
+    configureStorage,
+    STORAGE,
     assertUnderZipCap,
     batchFilesBySize,
     packVttIntoSizedFiles,

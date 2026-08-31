@@ -36,8 +36,9 @@ const {
   uniquePartZipIndex,
   assertUnderZipCap,
   batchFilesBySize,
-  MAX_ZIP_BYTES,
-  ZIP_PAYLOAD_BUDGET,
+  maxZipBytes,
+  zipPayloadBudget,
+  configureStorage,
   packVttIntoSizedFiles,
   parseVttCueBlocks,
 } = require('./optimize.js');
@@ -346,21 +347,24 @@ run('buildStoryboardVttBody: cues use 1s steps and .webp #xywh URLs', () => {
   assertEqual(countStoryboardThumbs(3, 1), 3, 'three thumbs for 3s');
 });
 
-run('assertUnderZipCap / batchFilesBySize: 1 GiB safety', () => {
-  assertEqual(MAX_ZIP_BYTES, 1024 * 1024 * 1024, '1 GiB cap');
-  assertTrue(ZIP_PAYLOAD_BUDGET < MAX_ZIP_BYTES, 'payload budget under cap');
+run('assertUnderZipCap / batchFilesBySize: cap comes from the backend', () => {
+  // No storage block in the payload (an older VPS): must behave exactly as
+  // before, GitHub with a 1 GiB cap.
+  configureStorage(null, 'gh-token');
+  assertEqual(maxZipBytes(), 1024 * 1024 * 1024, 'github 1 GiB cap');
+  assertTrue(zipPayloadBudget() < maxZipBytes(), 'payload budget under cap');
   let threw = false;
   try {
-    assertUnderZipCap(MAX_ZIP_BYTES + 1, 'test');
+    assertUnderZipCap(maxZipBytes() + 1, 'test');
   } catch (e) {
     threw = true;
     assertTrue(/exceeds/.test(e.message), 'error mentions exceeds');
   }
   assertTrue(threw, 'oversize throws');
-  assertUnderZipCap(MAX_ZIP_BYTES, 'at-cap-ok'); // exact cap allowed
+  assertUnderZipCap(maxZipBytes(), 'at-cap-ok'); // exact cap allowed
 
   const files = [
-    { name: 'a', size: MAX_ZIP_BYTES - 100 },
+    { name: 'a', size: maxZipBytes() - 100 },
     { name: 'b', size: 200 },
     { name: 'c', size: 50 },
   ];
@@ -368,6 +372,55 @@ run('assertUnderZipCap / batchFilesBySize: 1 GiB safety', () => {
   assertEqual(batches.length, 2, 'second file forces new batch');
   assertEqual(batches[0].length, 1, 'first batch one file');
   assertEqual(batches[1].length, 2, 'rest in second batch');
+});
+
+run('zip cap follows a GitLab job instead of staying at 1 GiB', () => {
+  // GitLab caps a release asset at ~95 MiB. Batching at GitHub's 1 GiB would
+  // build zips the API refuses outright, so the cap has to come from the job.
+  process.env.GITLAB_TOKEN = 'glpat-selftest';
+  configureStorage(
+    {
+      kind: 'gitlab',
+      api_base: 'https://gitlab.com/api/v4',
+      project_id: '1',
+      max_asset_bytes: 99614720,
+    },
+    'gh-token',
+  );
+  assertEqual(maxZipBytes(), 99614720, 'gitlab 95 MiB cap');
+  assertTrue(zipPayloadBudget() < 99614720, 'gitlab payload budget under cap');
+
+  // Two payloads that fit one GitHub zip must split for GitLab.
+  const files = [
+    { name: 'a', size: 90 * 1024 * 1024 },
+    { name: 'b', size: 90 * 1024 * 1024 },
+  ];
+  assertEqual(batchFilesBySize(files).length, 2, 'splits under the smaller cap');
+
+  let oversizeThrew = false;
+  try {
+    assertUnderZipCap(200 * 1024 * 1024, 'gitlab-oversize');
+  } catch (e) {
+    oversizeThrew = true;
+  }
+  assertTrue(oversizeThrew, '200 MiB rejected on gitlab');
+
+  // A GitLab job without the secret must fail loudly rather than silently
+  // falling back to the GitHub token and writing to the wrong place.
+  delete process.env.GITLAB_TOKEN;
+  let missingThrew = false;
+  try {
+    configureStorage({ kind: 'gitlab', api_base: 'x', project_id: '1' }, 'gh');
+  } catch (e) {
+    missingThrew = true;
+    assertTrue(/GITLAB_TOKEN/.test(e.message), 'names the missing secret');
+  }
+  assertTrue(missingThrew, 'missing GITLAB_TOKEN throws');
+
+  // STORAGE is module-global: reconfiguring back to GitHub must restore the
+  // GitHub cap, not leave the previous job's smaller one in place.
+  configureStorage(null, 'gh-token');
+  assertEqual(maxZipBytes(), 1024 * 1024 * 1024, 'cap resets with the backend');
 });
 
 run('packVttIntoSizedFiles: cue-aligned split under budget', () => {

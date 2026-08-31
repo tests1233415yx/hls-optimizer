@@ -34,10 +34,26 @@ Commit and push these files to the `main` branch of your new repository.
 4. Name the secret: `PRIVATE_REPO_TOKEN`
 5. Paste your Personal Access Token (PAT) into the value field and save.
 
+### Step 5 (only if you store files on GitLab)
+Files whose primary backend is GitLab are read and written on GitLab by the
+worker, so it needs a token for that project too.
+
+1. In GitLab: **Settings > Access Tokens** on your storage project, scope `api`.
+2. Add it to the **worker repository** as a secret named `GITLAB_TOKEN`.
+
+A job that targets GitLab without this secret fails with a clear error rather
+than quietly falling back to the GitHub token and writing to the wrong place.
+If all your files live on GitHub, you can skip this.
+
 ## How it works under the hood
 When your VPS triggers this repository with a `repository_dispatch` event:
 1. GitHub spins up a runner.
-2. It downloads the segmented parts of your private video using the `PRIVATE_REPO_TOKEN`.
+2. It downloads the segmented parts of your private video, using
+   `PRIVATE_REPO_TOKEN` for GitHub or `GITLAB_TOKEN` for GitLab. Which backend
+   a job uses comes from the `storage` block in the dispatch payload — the
+   payload carries only coordinates, never credentials.
 3. It combines the parts and runs FFmpeg locally on the runner.
-4. It packages HLS segments into 1GB zip files and uploads them back to the private release.
+4. It packages HLS segments into zip files and uploads them back to the private
+   release. The zip size cap follows the backend: 1 GiB on GitHub, ~95 MiB on
+   GitLab, which is that API's own asset limit.
 5. It sends a callback to your VPS backend to update the database state, completing the job!
