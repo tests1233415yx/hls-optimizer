@@ -1436,16 +1436,30 @@ function gitlabPostUpload(filePath, assetName, contentType, contentLength) {
 async function fetchReleaseInfo(owner, repo, releaseId, token) {
   if (STORAGE.kind === 'gitlab') {
     const links = await gitlabListReleaseLinks(releaseId);
-    return {
-      upload_url: null,
-      assets: links.map((l) => ({
-        id: l.id,
-        name: l.name,
-        url: l.direct_asset_url || l.url,
-        browser_download_url: l.direct_asset_url || l.url,
-        size: 0,
-      })),
-    };
+    // Sizes are probed rather than read from the API: GitLab's links endpoint
+    // reports none, and the source proxy sums them into totalSize before
+    // serving any range. Leaving them at 0 makes it answer
+    // `Content-Range: bytes 0--1/0` and hand ffprobe an empty body.
+    const assets = await Promise.all(
+      links.map(async (l) => {
+        const url = l.direct_asset_url || l.url;
+        return {
+          id: l.id,
+          name: l.name,
+          url,
+          browser_download_url: url,
+          size: await gitlabProbeAssetSize(url),
+        };
+      }),
+    );
+    const unsized = assets.filter((a) => !a.size).map((a) => a.name);
+    if (unsized.length > 0) {
+      throw new Error(
+        `Could not determine the size of ${unsized.length} GitLab asset(s) on release ${releaseId}: ${unsized.join(', ')}. ` +
+          `Continuing would serve a truncated source to ffmpeg.`,
+      );
+    }
+    return { upload_url: null, assets };
   }
   const res = await apiRequest(
     `https://api.github.com/repos/${owner}/${repo}/releases/${releaseId}`,
@@ -1456,6 +1470,60 @@ async function fetchReleaseInfo(owner, repo, releaseId, token) {
     },
   );
   return JSON.parse(res.body.toString('utf8'));
+}
+
+/**
+ * Byte size of one GitLab asset.
+ *
+ * GitLab's release-links API does not report sizes, and the worker needs them
+ * up front: the source proxy sums them into totalSize and serves ranges
+ * against it, so a missing size makes it answer `Content-Range: bytes 0--1/0`
+ * and hand ffprobe an empty body ("moov atom not found"). Mirrors the VPS's
+ * probeAssetSize: HEAD first, then a one-byte range for servers that refuse
+ * HEAD.
+ */
+async function gitlabProbeAssetSize(url, depth = 0) {
+  const followed = async (err) => {
+    // apiRequestRaw rejects on 3xx and does not follow redirects; GitLab can
+    // redirect an upload path, so take one hop rather than reporting size 0.
+    const loc = err && err.headers && err.headers.location;
+    if (!loc || depth >= 3) return 0;
+    return gitlabProbeAssetSize(new URL(loc, url).toString(), depth + 1);
+  };
+
+  try {
+    const head = await apiRequestRaw(url, 'HEAD', gitlabHeaders());
+    const cl = head.headers && head.headers['content-length'];
+    if (cl) {
+      const n = parseInt(cl, 10);
+      if (Number.isFinite(n) && n > 0) return n;
+    }
+  } catch (err) {
+    const viaRedirect = await followed(err);
+    if (viaRedirect > 0) return viaRedirect;
+  }
+
+  try {
+    const res = await apiRequestRaw(
+      url,
+      'GET',
+      gitlabHeaders({ Range: 'bytes=0-0', 'Accept-Encoding': 'identity' }),
+    );
+    const cr = res.headers && res.headers['content-range'];
+    if (cr) {
+      const m = String(cr).match(/\/(\d+)\s*$/);
+      if (m) return parseInt(m[1], 10);
+    }
+    const cl = res.headers && res.headers['content-length'];
+    if (cl) {
+      const n = parseInt(cl, 10);
+      if (Number.isFinite(n) && n > 0) return n;
+    }
+  } catch (err) {
+    const viaRedirect = await followed(err);
+    if (viaRedirect > 0) return viaRedirect;
+  }
+  return 0;
 }
 
 async function gitlabListReleaseLinks(releaseId) {
