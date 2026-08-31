@@ -39,6 +39,7 @@ const {
   maxZipBytes,
   zipPayloadBudget,
   configureStorage,
+  gitlabLinkToApiUrl,
   packVttIntoSizedFiles,
   parseVttCueBlocks,
 } = require('./optimize.js');
@@ -372,6 +373,39 @@ run('assertUnderZipCap / batchFilesBySize: cap comes from the backend', () => {
   assertEqual(batches.length, 2, 'second file forces new batch');
   assertEqual(batches[0].length, 1, 'first batch one file');
   assertEqual(batches[1].length, 2, 'rest in second batch');
+});
+
+run('gitlabLinkToApiUrl: release links must be read through the API path', () => {
+  // A release link stores the *web* URL. Requesting it with PRIVATE-TOKEN
+  // answers 403, so probing reported size 0 and the source proxy handed ffprobe
+  // an empty body ("moov atom not found"). Reads must go through
+  // /api/v4/projects/:id/uploads/:secret/:filename.
+  process.env.GITLAB_TOKEN = 'glpat-selftest';
+  configureStorage(
+    { kind: 'gitlab', api_base: 'https://gitlab.com/api/v4', project_id: '85638501' },
+    'gh-token',
+  );
+
+  const web = 'https://gitlab.com/gldrive/storage/-/project/85638501/uploads/0123456789abcdef0123456789abcdef/movie.mkv.part0000';
+  const api = gitlabLinkToApiUrl(web);
+  assertTrue(api.includes('/api/v4/projects/85638501/uploads/'), 'rewritten to the API path');
+  assertTrue(api.includes('0123456789abcdef0123456789abcdef'), 'keeps the upload secret');
+  assertTrue(api.endsWith('movie.mkv.part0000'), 'keeps the filename');
+
+  // Filenames with spaces must survive as a single encoded segment.
+  const spaced = gitlabLinkToApiUrl(
+    'https://gitlab.com/x/-/uploads/0123456789abcdef0123456789abcdef/2025-12-22%2013-59-47.mp4.part0000',
+  );
+  assertTrue(spaced.includes('2025-12-22%2013-59-47.mp4.part0000'), 'space stays encoded');
+
+  // Already-API urls are left alone (idempotent).
+  assertEqual(gitlabLinkToApiUrl(api), api, 'idempotent on an API url');
+
+  // Anything unrecognised is returned untouched rather than mangled.
+  assertEqual(gitlabLinkToApiUrl('https://example.com/x'), 'https://example.com/x', 'unknown url untouched');
+
+  delete process.env.GITLAB_TOKEN;
+  configureStorage(null, 'gh-token');
 });
 
 run('zip cap follows a GitLab job instead of staying at 1 GiB', () => {

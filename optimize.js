@@ -1280,6 +1280,38 @@ function gitlabApiUploadUrl(fullPath) {
 }
 
 /**
+ * Rewrite a release link's URL into the API upload form.
+ *
+ * A release link stores the *web* URL (that is what shows in the GitLab UI),
+ * and the web path answers 403 to a PRIVATE-TOKEN request - so probing or
+ * downloading it directly reports no size and no bytes. Reads must go through
+ * /api/v4/projects/:id/uploads/:secret/:filename instead. Same rule as the
+ * VPS's toApiUploadDownloadUrl; the secret+filename form is used because the
+ * upload-id form needs Maintainer rights while this one works for Guest+.
+ */
+function gitlabLinkToApiUrl(linkUrl) {
+  if (!linkUrl) return linkUrl;
+  // Already an API upload URL - leave it alone.
+  if (/\/api\/v4\/projects\/[^/]+\/uploads\/(\d+|[a-f0-9]{32}\/)/i.test(linkUrl)) {
+    return linkUrl;
+  }
+  try {
+    const u = linkUrl.startsWith('http')
+      ? new URL(linkUrl)
+      : new URL(linkUrl, STORAGE.apiBase.replace(/\/api\/v4$/, ''));
+    const m = u.pathname.match(/\/uploads\/([a-f0-9]{32})\/([^/]+)$/i);
+    if (m) {
+      return gitlabProjectUrl(
+        `/uploads/${m[1]}/${encodeURIComponent(decodeURIComponent(m[2]))}`,
+      );
+    }
+  } catch (_) {
+    // fall through
+  }
+  return linkUrl;
+}
+
+/**
  * Two-step GitLab upload: multipart POST the file to the project, then attach
  * the returned path to the release as a link.
  *
@@ -1442,7 +1474,9 @@ async function fetchReleaseInfo(owner, repo, releaseId, token) {
     // `Content-Range: bytes 0--1/0` and hand ffprobe an empty body.
     const assets = await Promise.all(
       links.map(async (l) => {
-        const url = l.direct_asset_url || l.url;
+        // The link's own url is the web form, which 403s for PRIVATE-TOKEN;
+        // every read has to use the API upload path.
+        const url = gitlabLinkToApiUrl(l.url || l.direct_asset_url);
         return {
           id: l.id,
           name: l.name,
@@ -1452,11 +1486,15 @@ async function fetchReleaseInfo(owner, repo, releaseId, token) {
         };
       }),
     );
-    const unsized = assets.filter((a) => !a.size).map((a) => a.name);
+    const unsized = assets.filter((a) => !a.size);
     if (unsized.length > 0) {
+      // Include the probed URL: the failure mode here is almost always the
+      // wrong URL form (web path instead of the API upload path), and the name
+      // alone does not show that.
       throw new Error(
-        `Could not determine the size of ${unsized.length} GitLab asset(s) on release ${releaseId}: ${unsized.join(', ')}. ` +
-          `Continuing would serve a truncated source to ffmpeg.`,
+        `Could not determine the size of ${unsized.length} GitLab asset(s) on release ${releaseId}. ` +
+          `Continuing would serve a truncated source to ffmpeg. Probed: ` +
+          unsized.map((a) => `${a.name} -> ${a.url}`).join(' | '),
       );
     }
     return { upload_url: null, assets };
@@ -5204,6 +5242,7 @@ if (require.main === module) {
     maxZipBytes,
     zipPayloadBudget,
     configureStorage,
+    gitlabLinkToApiUrl,
     STORAGE,
     assertUnderZipCap,
     batchFilesBySize,
