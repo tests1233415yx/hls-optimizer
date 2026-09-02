@@ -13,6 +13,7 @@ const {
   parityFromIdet,
   fpsToRateString,
   isHdrSource,
+  isWideGamutSdrSource,
   normalizeFieldStrategy,
   normalizeFieldParity,
   generateKeyframeTimeline,
@@ -240,6 +241,27 @@ run('isHdrSource: PQ stream is HDR, SDR bt709 stream is not', () => {
   assertFalse(isHdrSource(sdrStream), 'bt709 SDR stream is not HDR');
   assertFalse(isHdrSource(null), 'null stream is not HDR');
   assertFalse(isHdrSource({}), 'empty stream is not HDR');
+});
+
+run('isWideGamutSdrSource: BT.2020 SDR yes, HDR no, bt709 no', () => {
+  assertTrue(
+    isWideGamutSdrSource({ color_transfer: 'bt2020-10', color_primaries: 'bt2020' }),
+    'bt2020 primaries + SDR transfer is wide-gamut SDR',
+  );
+  assertTrue(
+    isWideGamutSdrSource({ color_transfer: 'bt709', color_primaries: 'bt2020' }),
+    'bt2020 primaries + bt709 transfer is wide-gamut SDR',
+  );
+  assertFalse(
+    isWideGamutSdrSource({ color_transfer: 'smpte2084', color_primaries: 'bt2020' }),
+    'PQ/bt2020 is HDR, not wide-gamut SDR',
+  );
+  assertFalse(
+    isWideGamutSdrSource({ color_transfer: 'bt709', color_primaries: 'bt709' }),
+    'plain bt709 is not wide-gamut SDR',
+  );
+  assertFalse(isWideGamutSdrSource(null), 'null stream is not wide-gamut SDR');
+  assertFalse(isWideGamutSdrSource({}), 'empty stream is not wide-gamut SDR');
 });
 
 // ---------------------------------------------------------------------------

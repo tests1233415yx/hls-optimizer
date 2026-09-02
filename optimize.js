@@ -204,6 +204,22 @@ function buildTonemapFilter(wantsHighBitDepth) {
   return `zscale=transfer=linear:npl=100,format=gbrpf32le,tonemap=tonemap=hable:desat=0,zscale=transfer=bt709:matrix=bt709:primaries=bt709,format=${outFmt}`;
 }
 
+// Wide-gamut BT.2020 primaries but NOT HDR (SDR transfer such as bt2020-10/bt2020-12/bt709).
+// The picture is already SDR, so it needs a gamut + matrix conversion to bt709 — not the
+// tone-curve compression buildTonemapFilter applies, which would needlessly darken it.
+function isWideGamutSdrSource(videoStream) {
+  if (!videoStream || typeof videoStream !== 'object') return false;
+  if (isHdrSource(videoStream)) return false;
+  return String(videoStream.color_primaries || '').toLowerCase() === 'bt2020';
+}
+
+// BT.2020 SDR -> BT.709. zscale linearises, converts primaries/matrix, re-applies bt709.
+// Out-of-gamut colours clip (standard behaviour); no tonemap pass.
+function buildGamutConvertFilter(wantsHighBitDepth) {
+  const outFmt = wantsHighBitDepth ? 'yuv420p10le' : 'yuv420p';
+  return `zscale=primaries=bt709:transfer=bt709:matrix=bt709,format=${outFmt}`;
+}
+
 let _zscaleSupportPromise = null;
 // Same capability-check pattern as checkX264TenBitSupport/checkAv1TenBitSupport: probe the
 // actual ffmpeg build rather than assuming, since zscale/tonemap need libzimg compiled in.
@@ -4675,6 +4691,7 @@ async function main() {
       const sourceBitDepth = getSourceBitDepth(videoStream);
       const wantsHighBitDepth = sourceBitDepth >= 10;
 
+      // May hold a tonemap (HDR) or a plain gamut-conversion (wide-gamut SDR) chain.
       let tonemapFilter = null;
       if (isHdrSource(videoStream)) {
         if (await checkZscaleSupport()) {
@@ -4682,6 +4699,13 @@ async function main() {
           console.log(`HDR source detected (color_transfer=${videoStream && videoStream.color_transfer}, color_primaries=${videoStream && videoStream.color_primaries}) → applying zscale/tonemap HDR→SDR chain`);
         } else {
           console.warn('HDR source detected but ffmpeg lacks zscale/tonemap support - output colors will be wrong, consider a different ffmpeg build');
+        }
+      } else if (isWideGamutSdrSource(videoStream)) {
+        if (await checkZscaleSupport()) {
+          tonemapFilter = buildGamutConvertFilter(wantsHighBitDepth);
+          console.log(`Wide-gamut BT.2020 SDR source detected (color_transfer=${videoStream && videoStream.color_transfer}, color_primaries=${videoStream && videoStream.color_primaries}) → applying zscale BT.2020→BT.709 gamut conversion`);
+        } else {
+          console.warn('Wide-gamut BT.2020 source detected but ffmpeg lacks zscale support - output colors may be oversaturated, consider a different ffmpeg build');
         }
       }
 
@@ -5247,6 +5271,7 @@ if (require.main === module) {
     parityFromIdet,
     fpsToRateString,
     isHdrSource,
+    isWideGamutSdrSource,
     normalizeFieldStrategy,
     normalizeFieldParity,
     generateKeyframeTimeline,
