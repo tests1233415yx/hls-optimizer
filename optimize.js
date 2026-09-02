@@ -4693,12 +4693,21 @@ async function main() {
       // header unspecified, so players assume full range and expand a limited-range (tv)
       // source → lifted blacks / washed-out picture. After a tonemap the pixels are
       // limited-range bt709; otherwise mirror the source (defaulting to bt709 / tv).
+      // ffprobe reports unspecified color as "unknown"/"reserved"/"" — common for screen
+      // recordings. Forwarding those verbatim leaves the encoder tagging "unspecified",
+      // which is the same washed-out failure. Fall back to bt709.
+      // ponytail: assumes bt709 for untagged sources; genuine untagged SD (bt601) would be
+      // mistagged — add a height<=576 → smpte170m branch if SD sources start showing up.
+      const pickColor = (v, def) => {
+        const s = String(v || '').toLowerCase();
+        return (!s || s === 'unknown' || s === 'unspecified' || s === 'reserved') ? def : s;
+      };
       const outColor = tonemapFilter
         ? { primaries: 'bt709', trc: 'bt709', space: 'bt709', range: 'tv' }
         : {
-            primaries: videoStream.color_primaries || 'bt709',
-            trc: videoStream.color_transfer || 'bt709',
-            space: videoStream.color_space || 'bt709',
+            primaries: pickColor(videoStream.color_primaries, 'bt709'),
+            trc: pickColor(videoStream.color_transfer, 'bt709'),
+            space: pickColor(videoStream.color_space, 'bt709'),
             range: String(videoStream.color_range || '').toLowerCase() === 'pc' ? 'pc' : 'tv',
           };
       ffmpegArgs.push(
