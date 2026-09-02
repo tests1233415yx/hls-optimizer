@@ -3687,7 +3687,7 @@ async function main() {
 
   // 5. Probe video stream properties
   console.log('Probing video stream properties...');
-  const probeCmd = `ffprobe -v error -analyzeduration 100M -probesize 100M -show_entries "format=duration,size,bit_rate:stream=index,codec_type,codec_name,width,height,channels,r_frame_rate,avg_frame_rate,bit_rate,field_order,pix_fmt,bits_per_raw_sample,profile,color_transfer,color_primaries,color_space:stream_tags" -of json -protocol_whitelist file,http,tcp,https,tls "${inputSource}"`;
+  const probeCmd = `ffprobe -v error -analyzeduration 100M -probesize 100M -show_entries "format=duration,size,bit_rate:stream=index,codec_type,codec_name,width,height,channels,r_frame_rate,avg_frame_rate,bit_rate,field_order,pix_fmt,bits_per_raw_sample,profile,color_transfer,color_primaries,color_space,color_range:stream_tags" -of json -protocol_whitelist file,http,tcp,https,tls "${inputSource}"`;
   const probeData = JSON.parse(await execAsync(probeCmd, { maxBuffer: 100 * 1024 * 1024 }));
 
   const videoStream = probeData.streams.find(s => s.codec_type === 'video');
@@ -4687,6 +4687,26 @@ async function main() {
 
       const vfChain = buildScaleVf(tHeight, fieldPlan, tonemapFilter);
       console.log(`Video filter chain for ${codec} [${fieldPlan.strategy}]: ${vfChain}`);
+
+      // Signal output color explicitly on every encode. libx264 defaults to writing the
+      // source's range (tv); libsvtav1 does NOT propagate it and leaves the AV1 sequence
+      // header unspecified, so players assume full range and expand a limited-range (tv)
+      // source → lifted blacks / washed-out picture. After a tonemap the pixels are
+      // limited-range bt709; otherwise mirror the source (defaulting to bt709 / tv).
+      const outColor = tonemapFilter
+        ? { primaries: 'bt709', trc: 'bt709', space: 'bt709', range: 'tv' }
+        : {
+            primaries: videoStream.color_primaries || 'bt709',
+            trc: videoStream.color_transfer || 'bt709',
+            space: videoStream.color_space || 'bt709',
+            range: String(videoStream.color_range || '').toLowerCase() === 'pc' ? 'pc' : 'tv',
+          };
+      ffmpegArgs.push(
+        '-color_primaries', outColor.primaries,
+        '-color_trc', outColor.trc,
+        '-colorspace', outColor.space,
+        '-color_range', outColor.range,
+      );
 
       // Output CFR after field restore so HLS timestamps stay stable (IVTC/bob).
       if (fieldPlan.outFps) {
