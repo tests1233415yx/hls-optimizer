@@ -94,7 +94,8 @@ jobs:
 
           if [ -n "$REMOTE_VERSION" ] && command -v ffmpeg >/dev/null \
              && [ "$(cat "$STAMP" 2>/dev/null)" = "$REMOTE_VERSION" ] \
-             && ffmpeg -buildconf 2>/dev/null | grep -q svtav1; then
+             && ffmpeg -buildconf 2>/dev/null | grep -q svtav1 \
+             && ffmpeg -buildconf 2>/dev/null | grep -q libaom; then
             echo "ffmpeg already up to date ($REMOTE_VERSION), skipping download"
             ffmpeg -version | head -1
           else

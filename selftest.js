@@ -329,13 +329,14 @@ run('generateKeyframeTimeline: empty scene list falls back to regular targetSec 
 // Thumbnail storyboard (5s / 320 / 10×10 / WebP)
 // ---------------------------------------------------------------------------
 
-run('THUMB_STORYBOARD constants: 1s interval, 480px tiles, 10x10, webp q85', () => {
+run('THUMB_STORYBOARD constants: 1s interval, 480px tiles, 5x5, avif crf30', () => {
   assertEqual(THUMB_STORYBOARD.intervalSec, 1, 'intervalSec');
   assertEqual(THUMB_STORYBOARD.tileWidth, 480, 'tileWidth');
   assertEqual(THUMB_STORYBOARD.cols, 5, 'cols');
   assertEqual(THUMB_STORYBOARD.rows, 5, 'rows');
-  assertEqual(THUMB_STORYBOARD.extension, 'webp', 'extension');
-  assertEqual(THUMB_STORYBOARD.webpQuality, 85, 'webpQuality');
+  assertEqual(THUMB_STORYBOARD.extension, 'avif', 'extension');
+  assertEqual(THUMB_STORYBOARD.avifCrf, 30, 'avifCrf');
+  assertEqual(THUMB_STORYBOARD.avifCpuUsed, 6, 'avifCpuUsed');
 });
 
 run('countStoryboardThumbs: ceil(duration/interval) @ 1s', () => {
@@ -349,23 +350,23 @@ run('storyboard sheet naming and index (5x5 = 25 tiles/sheet)', () => {
   assertEqual(storyboardSheetIndexForThumb(0), 0, 'first thumb sheet 0');
   assertEqual(storyboardSheetIndexForThumb(24), 0, '24 still sheet 0');
   assertEqual(storyboardSheetIndexForThumb(25), 1, '25 starts sheet 1');
-  assertEqual(storyboardSheetName(0, 'webp'), 'thumb_sprite_001.webp', 'sheet 0 name');
-  assertEqual(storyboardSheetName(2, 'webp'), 'thumb_sprite_003.webp', 'sheet 2 name');
-  assertTrue(storyboardSpriteGlob('webp').test('thumb_sprite_001.webp'), 'glob matches webp');
-  assertFalse(storyboardSpriteGlob('webp').test('thumb_sprite_001.jpg'), 'glob rejects jpg');
+  assertEqual(storyboardSheetName(0, 'avif'), 'thumb_sprite_001.avif', 'sheet 0 name');
+  assertEqual(storyboardSheetName(2, 'avif'), 'thumb_sprite_003.avif', 'sheet 2 name');
+  assertTrue(storyboardSpriteGlob('avif').test('thumb_sprite_001.avif'), 'glob matches avif');
+  assertFalse(storyboardSpriteGlob('avif').test('thumb_sprite_001.webp'), 'glob rejects other extensions');
 });
 
-run('buildStoryboardVttBody: cues use 1s steps and .webp #xywh URLs', () => {
+run('buildStoryboardVttBody: cues use 1s steps and .avif #xywh URLs', () => {
   const body = buildStoryboardVttBody(3, 320, 180, {
     intervalSec: 1,
     cols: 10,
     rows: 10,
-    extension: 'webp',
+    extension: 'avif',
   });
   // 3s / 1s → 3 thumbs
   assertTrue(body.includes('00:00:00.000 --> 00:00:01.000'), 'first cue');
-  assertTrue(body.includes('thumbnails/thumb_sprite_001.webp#xywh=0,0,320,180'), 'first tile webp');
-  assertTrue(body.includes('thumbnails/thumb_sprite_001.webp#xywh=320,0,320,180'), 'second col');
+  assertTrue(body.includes('thumbnails/thumb_sprite_001.avif#xywh=0,0,320,180'), 'first tile avif');
+  assertTrue(body.includes('thumbnails/thumb_sprite_001.avif#xywh=320,0,320,180'), 'second col');
   assertFalse(body.includes('.jpg'), 'no jpeg references');
   assertEqual(countStoryboardThumbs(3, 1), 3, 'three thumbs for 3s');
 });
