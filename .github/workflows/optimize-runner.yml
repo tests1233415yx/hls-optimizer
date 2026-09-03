@@ -59,7 +59,8 @@ jobs:
             echo "Downloading FFmpeg static build (remote build: ${REMOTE_VERSION:-unknown, API lookup failed})..."
             DL="${RUNNER_TEMP:-/tmp}/ffmpeg.tar.xz"
             EXTRACT="${RUNNER_TEMP:-/tmp}/ffmpeg-extract"
-            if ! curl -fsSL --retry 5 --retry-delay 5 https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/$ASSET -o "$DL"; then
+            rm -f "$DL"
+            if ! curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors --retry-connrefused --connect-timeout 20 -C - https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/$ASSET -o "$DL"; then
               echo "Error: Failed to download FFmpeg from BtbN/FFmpeg-Builds."
               exit 1
             fi
