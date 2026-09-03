@@ -3392,12 +3392,14 @@ function shouldComputeSegmentTimeline(kind, { isSubtitlesJob = false, isThumbnai
 }
 
 // Storyboard scrub previews: 1s tiles @ 480px WebP q85.
-// 10×10 = 100 tiles/sheet ≈ 1m40s per sheet; multi-zip under MAX_ZIP_BYTES like video/audio.
+// 5×5 = 25 tiles/sheet ≈ 25s per sheet; multi-zip under MAX_ZIP_BYTES like video/audio.
+// Grid stays small on purpose: a scrub hover downloads one whole sheet, so 100 tiles/sheet
+// meant multi-MB per hover at the same tile quality.
 const THUMB_STORYBOARD = Object.freeze({
   intervalSec: 1,
   tileWidth: 480,
-  cols: 10,
-  rows: 10,
+  cols: 5,
+  rows: 5,
   // WebP: simple image2 sequence, decodes everywhere we care about (Safari/iOS/FF/Chrome).
   extension: 'webp',
   webpQuality: 85,

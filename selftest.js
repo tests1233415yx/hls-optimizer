@@ -332,8 +332,8 @@ run('generateKeyframeTimeline: empty scene list falls back to regular targetSec 
 run('THUMB_STORYBOARD constants: 1s interval, 480px tiles, 10x10, webp q85', () => {
   assertEqual(THUMB_STORYBOARD.intervalSec, 1, 'intervalSec');
   assertEqual(THUMB_STORYBOARD.tileWidth, 480, 'tileWidth');
-  assertEqual(THUMB_STORYBOARD.cols, 10, 'cols');
-  assertEqual(THUMB_STORYBOARD.rows, 10, 'rows');
+  assertEqual(THUMB_STORYBOARD.cols, 5, 'cols');
+  assertEqual(THUMB_STORYBOARD.rows, 5, 'rows');
   assertEqual(THUMB_STORYBOARD.extension, 'webp', 'extension');
   assertEqual(THUMB_STORYBOARD.webpQuality, 85, 'webpQuality');
 });
@@ -344,11 +344,11 @@ run('countStoryboardThumbs: ceil(duration/interval) @ 1s', () => {
   assertEqual(countStoryboardThumbs(0, 1), 0, 'zero duration');
 });
 
-run('storyboard sheet naming and index (10x10 = 100 tiles/sheet)', () => {
-  assertEqual(storyboardTilesPerSheet(10, 10), 100, 'tiles per sheet');
+run('storyboard sheet naming and index (5x5 = 25 tiles/sheet)', () => {
+  assertEqual(storyboardTilesPerSheet(5, 5), 25, 'tiles per sheet');
   assertEqual(storyboardSheetIndexForThumb(0), 0, 'first thumb sheet 0');
-  assertEqual(storyboardSheetIndexForThumb(99), 0, '99 still sheet 0');
-  assertEqual(storyboardSheetIndexForThumb(100), 1, '100 starts sheet 1');
+  assertEqual(storyboardSheetIndexForThumb(24), 0, '24 still sheet 0');
+  assertEqual(storyboardSheetIndexForThumb(25), 1, '25 starts sheet 1');
   assertEqual(storyboardSheetName(0, 'webp'), 'thumb_sprite_001.webp', 'sheet 0 name');
   assertEqual(storyboardSheetName(2, 'webp'), 'thumb_sprite_003.webp', 'sheet 2 name');
   assertTrue(storyboardSpriteGlob('webp').test('thumb_sprite_001.webp'), 'glob matches webp');
