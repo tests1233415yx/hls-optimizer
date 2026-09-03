@@ -3401,13 +3401,11 @@ const THUMB_STORYBOARD = Object.freeze({
   cols: 5,
   rows: 5,
   // WebP: simple image2 sequence, decodes everywhere we care about (Safari/iOS/FF/Chrome).
-  // AVIF: ~40% smaller than WebP q85 at the same visual quality, so a scrub
-  // hover pulls that much less. Needs Chrome 85+/Firefox 93+/Safari 16+.
-  extension: 'avif',
-  // crf 30 sits at WebP-q85 quality here; cpu-used 6 keeps the (much slower
-  // than libwebp) encode reasonable across a long video's many sheets.
-  avifCrf: 30,
-  avifCpuUsed: 6,
+  // WebP: an AVIF attempt (image2 + libaom-av1 still pictures) produced valid
+  // containers that browsers refused to render, so any retry needs a sheet
+  // checked in a real browser first.
+  extension: 'webp',
+  webpQuality: 85,
 });
 
 function countStoryboardThumbs(durationSec, intervalSec = THUMB_STORYBOARD.intervalSec) {
@@ -3426,7 +3424,7 @@ function storyboardSheetIndexForThumb(thumbIndex0, cols = THUMB_STORYBOARD.cols,
   return Math.floor(thumbIndex0 / per);
 }
 
-/** 0-based sheet index → thumb_sprite_001.avif style name */
+/** 0-based sheet index → thumb_sprite_001.webp style name */
 function storyboardSheetName(sheetIndex0, extension = THUMB_STORYBOARD.extension) {
   return `thumb_sprite_${String(sheetIndex0 + 1).padStart(3, '0')}.${extension}`;
 }
@@ -3458,18 +3456,18 @@ function buildStoryboardVttBody(durationSec, tileWidth, tileHeight, opts = {}) {
 }
 
 function storyboardSpriteGlob(extension = THUMB_STORYBOARD.extension) {
-  // Escape for RegExp; extension is a fixed constant (avif) in production.
+  // Escape for RegExp; extension is a fixed constant (webp) in production.
   const esc = String(extension).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   return new RegExp(`^thumb_sprite_\\d+\\.${esc}$`);
 }
 
-function hasLibaomAv1Encoder() {
+function hasLibwebpEncoder() {
   try {
     const out = execSync('ffmpeg -hide_banner -encoders 2>&1', {
       encoding: 'utf8',
       maxBuffer: 2 * 1024 * 1024,
     });
-    return /\blibaom-av1\b/.test(out);
+    return /\blibwebp\b/.test(out);
   } catch {
     return false;
   }
@@ -4141,15 +4139,14 @@ async function main() {
       cols: THUMB_COLS,
       rows: THUMB_ROWS,
       extension: THUMB_EXT,
-      avifCrf,
-      avifCpuUsed,
+      webpQuality,
     } = THUMB_STORYBOARD;
     const videoDurationVal = duration || 0;
 
     if (videoDurationVal > 0) {
-      if (!hasLibaomAv1Encoder()) {
+      if (!hasLibwebpEncoder()) {
         throw new Error(
-          'Thumbnail storyboard requires ffmpeg libaom-av1 for AVIF sprites, but libaom-av1 is not available on this runner',
+          'Thumbnail storyboard requires ffmpeg libwebp for WebP sprites, but libwebp is not available on this runner',
         );
       }
 
@@ -4161,13 +4158,9 @@ async function main() {
         '-protocol_whitelist file,http,tcp,https,tls',
         `-i "${inputSource}"`,
         `-vf "fps=1/${THUMB_INTERVAL},scale=${THUMB_TILE_WIDTH}:-2,tile=${THUMB_COLS}x${THUMB_ROWS}"`,
-        // image2 + an .avif name gives one real AVIF container per sheet in a
-        // single pass (still-picture, so no sequence header per tile).
         '-f image2',
-        '-c:v libaom-av1',
-        '-still-picture 1',
-        `-crf ${avifCrf}`,
-        `-cpu-used ${avifCpuUsed}`,
+        '-c:v libwebp',
+        `-quality ${webpQuality}`,
         `"${spritePattern}"`,
       ].join(' ');
       console.log(`Executing thumbnail sprite command: ${spriteCmd}`);
